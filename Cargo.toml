@@ -9,6 +9,7 @@ edition = "2021"
 [dependencies]
 array-init = "2"
 memoffset = "0.7"
+glam = "0.22"
 
 [dependencies.windows]
 version = "0.43.0"
