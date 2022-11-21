@@ -11,11 +11,9 @@ use memoffset::offset_of;
 
 use std::mem::transmute;
 
-fn msg_box(msg: &str) {
+unsafe fn msg_box(msg: &str) {
     let msg: HSTRING = msg.into();
-    unsafe {
-        MessageBoxW(None, &msg, w!("Error"), MB_OK);
-    }
+    MessageBoxW(None, &msg, w!("Error"), MB_OK);
 }
 
 extern "system" fn wndproc(
@@ -24,31 +22,33 @@ extern "system" fn wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    match message {
-        WM_CLOSE => {
-            unsafe { DestroyWindow(window) };
-            LRESULT::default()
-        }
-        WM_DESTROY => {
-            unsafe { PostQuitMessage(0) };
-            LRESULT::default()
-        }
-        WM_KEYDOWN => {
-            if wparam.0 == VK_ESCAPE.0 as usize {
-                unsafe { PostQuitMessage(0) };
+    unsafe {
+        match message {
+            WM_CLOSE => {
+                DestroyWindow(window);
+                LRESULT::default()
             }
-            LRESULT::default()
-        }
-        _ => {
-            unsafe { DefWindowProcW(window, message, wparam, lparam) }
+            WM_DESTROY => {
+                PostQuitMessage(0);
+                LRESULT::default()
+            }
+            WM_KEYDOWN => {
+                if wparam.0 == VK_ESCAPE.0 as usize {
+                    PostQuitMessage(0);
+                }
+                LRESULT::default()
+            }
+            _ => {
+                DefWindowProcW(window, message, wparam, lparam)
+            }
         }
     }
 }
 
-fn create_window(win_title: &str, width: i32, height: i32) -> HWND {
+unsafe fn create_window(win_title: &str, width: i32, height: i32) -> HWND {
     let class_name = w!("DxrTutorialWindowClass");
 
-    let instance = unsafe { GetModuleHandleW(None).unwrap() };
+    let instance = GetModuleHandleW(None).unwrap();
 
     // Register the window class
     let wc = WNDCLASSEXW {
@@ -60,7 +60,7 @@ fn create_window(win_title: &str, width: i32, height: i32) -> HWND {
         ..Default::default()
     };
 
-    if (unsafe { RegisterClassExW(&wc) } == 0) {
+    if RegisterClassExW(&wc) == 0 {
         msg_box("RegisterClass() failed");
         unreachable!()
     }
@@ -72,7 +72,7 @@ fn create_window(win_title: &str, width: i32, height: i32) -> HWND {
         right: width,
         bottom: height,
     };
-    unsafe { AdjustWindowRect(&mut r, WS_OVERLAPPEDWINDOW, false) };
+    AdjustWindowRect(&mut r, WS_OVERLAPPEDWINDOW, false);
 
     let window_width = r.right - r.left;
     let window_height = r.bottom - r.top;
@@ -80,22 +80,20 @@ fn create_window(win_title: &str, width: i32, height: i32) -> HWND {
     // create the window
     let w_title: HSTRING = win_title.into();
 
-    let hwnd = unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            class_name,
-            &w_title,
-            WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            window_width,
-            window_height,
-            None, // no parent window
-            None, // no menus
-            instance,
-            None,
-        )
-    };
+    let hwnd = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        class_name,
+        &w_title,
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        window_width,
+        window_height,
+        None, // no parent window
+        None, // no menus
+        instance,
+        None,
+    );
 
     if hwnd.0 == 0 {
         msg_box("CreateWindowEx() failed");
@@ -106,17 +104,15 @@ fn create_window(win_title: &str, width: i32, height: i32) -> HWND {
 
 }
 
-fn msg_loop() {
+unsafe fn msg_loop() {
     let mut message = MSG::default();
     loop {
-        if unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.into() {
+        if PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).into() {
             if message.message == WM_QUIT {
                 break;
             }
-            unsafe {
-                TranslateMessage(&message);
-                DispatchMessageW(&message);
-            }
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
         } else {
 
         }
@@ -145,14 +141,14 @@ impl Tutorial {
     }
 }
 
-fn main() {
+unsafe fn unsafe_main() {
     let mut tutorial = Tutorial::new();
 
     let hwnd = create_window("fuck", 640, 360);
 
     // Calculate the client-rect area
     let mut r = RECT::default();
-    unsafe { GetClientRect(hwnd, &mut r) };
+    GetClientRect(hwnd, &mut r);
     let width = r.right - r.left;
     let height = r.bottom - r.top;
 
@@ -160,11 +156,15 @@ fn main() {
     tutorial.on_load(hwnd, width, height);
 
     // Show the window
-    unsafe { ShowWindow(hwnd, SW_SHOWNORMAL) };
+    ShowWindow(hwnd, SW_SHOWNORMAL);
 
     // Start the msgLoop()
     msg_loop();
 
     // Cleanup
-    unsafe { DestroyWindow(hwnd) };
+    DestroyWindow(hwnd);
+}
+
+fn main() {
+    unsafe { unsafe_main() };
 }
