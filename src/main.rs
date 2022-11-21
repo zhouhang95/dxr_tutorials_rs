@@ -40,7 +40,7 @@ extern "system" fn wndproc(
             LRESULT::default()
         }
         _ => {
-            unsafe { DefWindowProcA(window, message, wparam, lparam) }
+            unsafe { DefWindowProcW(window, message, wparam, lparam) }
         }
     }
 }
