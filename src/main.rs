@@ -10,8 +10,8 @@ use windows::{
 use memoffset::offset_of;
 use glam::*;
 
-use std::{mem::transmute, ffi::c_void};
-use std::mem::size_of;
+use std::mem::{size_of, size_of_val, ManuallyDrop};
+use std::ffi::c_void;
 
 const DEFAULT_SWAP_CHAIN_BUFFERS: u32 = 3;
 const RTV_HEAP_SIZE: u32 = 3;
@@ -209,6 +209,32 @@ unsafe fn resource_barrier(cmd_list: ID3D12GraphicsCommandList4, resource: ID3D1
     cmd_list.ResourceBarrier(&[barrier]);
 }
 
+const UPLOAD_HEAP_PROPS: D3D12_HEAP_PROPERTIES  = D3D12_HEAP_PROPERTIES {
+    Type: D3D12_HEAP_TYPE_UPLOAD,
+    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+    MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+    CreationNodeMask: 0,
+    VisibleNodeMask: 0,
+};
+
+const DEFAULT_HEAP_PROPS: D3D12_HEAP_PROPERTIES = D3D12_HEAP_PROPERTIES {
+    Type: D3D12_HEAP_TYPE_DEFAULT,
+    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+    MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+    CreationNodeMask: 0,
+    VisibleNodeMask: 0,
+};
+
+struct BLASBuffers {
+    scratch: ID3D12Resource,
+    result: ID3D12Resource,
+}
+struct TLASBuffers {
+    scratch: ID3D12Resource,
+    result: ID3D12Resource,
+    instance_desc: ID3D12Resource,
+}
+
 struct Tutorial {
     hwnd: HWND,
     swap_chain_size: IVec2,
@@ -222,6 +248,10 @@ struct Tutorial {
     fence: ID3D12Fence,
     fence_event: HANDLE,
     fence_value: u64,
+    vert_buf: Option<ID3D12Resource>,
+    tlas: Option<ID3D12Resource>,
+    blas: Option<ID3D12Resource>,
+    tlas_size: u64,
 }
 
 struct HeapData {
@@ -235,6 +265,189 @@ struct FrameObject {
 }
 
 impl Tutorial {
+    unsafe fn create_buffer(
+        &self,
+        size: u64,
+        flags: D3D12_RESOURCE_FLAGS,
+        init_state: D3D12_RESOURCE_STATES,
+        heap_props: &D3D12_HEAP_PROPERTIES,
+    ) -> ID3D12Resource {
+        let buf_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Alignment: 0,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_UNKNOWN,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        self.device.CreateCommittedResource(heap_props, D3D12_HEAP_FLAG_NONE, &buf_desc, init_state, None, &mut buffer).unwrap();
+        buffer.unwrap()
+    }
+    unsafe fn create_triangle_vert_buffer(&self) -> ID3D12Resource {
+        let vertices = [
+            vec3(0.,       1., 0.),
+            vec3(0.866,  -0.5, 0.),
+            vec3(-0.866, -0.5, 0.),
+        ];
+
+        // Note: using upload heaps to transfer static data like vert buffers is
+        // not recommended. Every time the GPU needs it, the upload heap will be
+        // marshalled over. Please read up on Default Heap usage. An upload heap
+        // is used here for code simplicity and because there are very few verts
+        // to actually transfer.
+
+        // For simplicity, we create the vertex buffer on the upload heap, but that's not required
+        let vertex_buffer = self.create_buffer(size_of_val(&vertices) as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &UPLOAD_HEAP_PROPS);
+        let mut data = std::ptr::null_mut();
+        vertex_buffer.Map(0, None, Some(&mut data)).unwrap();
+        std::ptr::copy_nonoverlapping(
+            vertices.as_ptr(),
+            data as _,
+            vertices.len(),
+        );
+        vertex_buffer.Unmap(0, None);
+        vertex_buffer
+    }
+    unsafe fn create_blas(&self, vert_buf: &ID3D12Resource) -> BLASBuffers {
+        let geom_desc = D3D12_RAYTRACING_GEOMETRY_DESC {
+            Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
+            Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+            Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
+                Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
+                    VertexFormat: DXGI_FORMAT_R32G32B32_FLOAT,
+                    VertexCount: 3,
+                    VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
+                        StartAddress: vert_buf.GetGPUVirtualAddress(),
+                        StrideInBytes: size_of::<Vec3>() as u64,
+                    },
+                    ..Default::default()
+                }
+            },
+        };
+
+        // Get the size requirements for the scratch and AS buffers
+        let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+            Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
+            Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE,
+            NumDescs: 1,
+            DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+            Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                pGeometryDescs: &geom_desc,
+            },
+        };
+        let mut info = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
+        self.device.GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &mut info);
+
+        // Create the buffers. They need to support UAV, and since we are going to immediately use them, we create them with an unordered-access state
+        let buffers = BLASBuffers {
+            scratch: self.create_buffer(info.ScratchDataSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &DEFAULT_HEAP_PROPS),
+            result: self.create_buffer(info.ResultDataMaxSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, &DEFAULT_HEAP_PROPS),
+        };
+
+        // Create the bottom-level AS
+        let as_desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+            DestAccelerationStructureData: buffers.result.GetGPUVirtualAddress(),
+            Inputs: inputs,
+            ScratchAccelerationStructureData: buffers.scratch.GetGPUVirtualAddress(),
+            ..Default::default()
+        };
+
+        self.cmd_list.BuildRaytracingAccelerationStructure(&as_desc, None);
+
+        // We need to insert a UAV barrier before using the acceleration structures in a raytracing operation
+        let uav_barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER{ pResource: Some(buffers.result.clone()) }),
+            },
+            ..Default::default()
+        };
+        self.cmd_list.ResourceBarrier(&[uav_barrier]);
+        buffers
+    }
+    unsafe fn create_tlas(&mut self, blas: ID3D12Resource) -> TLASBuffers {
+        // First, get the size of the TLAS buffers and create them
+        let mut inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+            Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+            Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE,
+            NumDescs: 1,
+            DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+            ..Default::default()
+        };
+        let mut info = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
+        self.device.GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &mut info);
+
+        // Create the buffers
+        let mut buffers = TLASBuffers {
+            scratch: self.create_buffer(info.ScratchDataSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &DEFAULT_HEAP_PROPS),
+            result: self.create_buffer(info.ResultDataMaxSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, &DEFAULT_HEAP_PROPS),
+            instance_desc: self.create_buffer(size_of::<D3D12_RAYTRACING_INSTANCE_DESC>() as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &UPLOAD_HEAP_PROPS),
+        };
+        self.tlas_size = info.ResultDataMaxSizeInBytes;
+
+        // The instance desc should be inside a buffer, create and map the buffer
+        let mut instance_desc = std::ptr::null_mut();
+        buffers.instance_desc.Map(0, None, Some(&mut instance_desc)).unwrap();
+        let instance_desc: *mut D3D12_RAYTRACING_INSTANCE_DESC = instance_desc as _;
+
+        // Initialize the instance desc. We only have a single instance
+        let m = Mat4::IDENTITY;
+        std::ptr::copy_nonoverlapping::<f32>(
+            m.as_ref() as _,
+            (*instance_desc).Transform.as_mut_ptr() as _,
+            (*instance_desc).Transform.len(),
+        );
+        (*instance_desc).AccelerationStructure = blas.GetGPUVirtualAddress();
+        (*instance_desc)._bitfield1 = 0xFF000000;
+        (*instance_desc)._bitfield2 = 0;
+
+        // Unmap
+        buffers.instance_desc.Unmap(0, None);
+
+        // Create the TLAS
+        inputs.Anonymous = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+             InstanceDescs: buffers.instance_desc.GetGPUVirtualAddress(),
+        };
+        let as_desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+            DestAccelerationStructureData: buffers.result.GetGPUVirtualAddress(),
+            Inputs: inputs,
+            ScratchAccelerationStructureData: buffers.scratch.GetGPUVirtualAddress(),
+            ..Default::default()
+        };
+
+        // self.cmd_list.BuildRaytracingAccelerationStructure(&as_desc, None);
+
+        // We need to insert a UAV barrier before using the acceleration structures in a raytracing operation
+        let uav_barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER{ pResource: Some(buffers.result.clone()) }),
+            },
+            ..Default::default()
+        };
+        self.cmd_list.ResourceBarrier(&[uav_barrier]);
+        buffers
+    }
+    unsafe fn create_acceleration_structures(&mut self) {
+        let vert_buf = self.create_triangle_vert_buffer();
+        let bottom_level_buffer = self.create_blas(&vert_buf);
+        let top_level_buffer = self.create_tlas(bottom_level_buffer.result.clone());
+        self.vert_buf = Some(vert_buf);
+
+        self.submit_cmd_list();
+        self.fence.SetEventOnCompletion(self.fence_value, self.fence_event).unwrap();
+        WaitForSingleObject(self.fence_event, INFINITE);
+        //let buffer_index = swap_chain.GetCurrentBackBufferIndex();
+        self.cmd_list.Reset(&self.frame_objects[0].cmd_allocator, None).unwrap();
+
+        self.blas = Some(bottom_level_buffer.result.clone());
+        self.tlas = Some(top_level_buffer.result.clone());
+    }
     unsafe fn submit_cmd_list(&mut self) {
         self.cmd_list.Close().unwrap();
         let command_list = ID3D12CommandList::from(&self.cmd_list);
@@ -285,10 +498,16 @@ impl Tutorial {
             fence,
             fence_event,
             fence_value: 0,
+            vert_buf: None,
+            tlas: None,
+            blas: None,
+            tlas_size: 0,
         }
     }
     unsafe fn on_load(hwnd: HWND, width: i32, height: i32) -> Self {
-        Self::init_dxr(hwnd, width, height)
+        let mut tutor = Self::init_dxr(hwnd, width, height);
+        tutor.create_acceleration_structures();
+        tutor
     }
     unsafe fn begin_frame(&mut self) -> usize {
         self.swap_chain.GetCurrentBackBufferIndex() as usize
