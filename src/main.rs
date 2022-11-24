@@ -209,15 +209,6 @@ unsafe fn resource_barrier(cmd_list: ID3D12GraphicsCommandList4, resource: ID3D1
     cmd_list.ResourceBarrier(&[barrier]);
 }
 
-unsafe fn submit_cmd_list(cmd_list: ID3D12GraphicsCommandList4, cmd_queue: ID3D12CommandQueue, fence: ID3D12Fence, mut fence_value: u64) -> u64 {
-    cmd_list.Close().unwrap();
-    let command_list = ID3D12CommandList::from(&cmd_list);
-    cmd_queue.ExecuteCommandLists(&[Some(command_list)]);
-    fence_value += 1;
-    cmd_queue.Signal(&fence, fence_value).unwrap();
-    fence_value
-}
-
 struct Tutorial {
     hwnd: HWND,
     swap_chain_size: IVec2,
@@ -251,18 +242,8 @@ impl Tutorial {
         self.fence_value += 1;
         self.cmd_queue.Signal(&self.fence, self.fence_value).unwrap();
     }
-    unsafe fn init_dxr(hwnd: HWND, width: i32, height: i32) -> (
-        IDXGIFactory4,
-        ID3D12Device5,
-        ID3D12CommandQueue,
-        IDXGISwapChain3,
-        HeapData,
-        [FrameObject; DEFAULT_SWAP_CHAIN_BUFFERS as usize],
-        ID3D12GraphicsCommandList4,
-        ID3D12Fence,
-        HANDLE,
-    ) {
-        if cfg!(DEBUG_MODE) {
+    unsafe fn init_dxr(hwnd: HWND, width: i32, height: i32) -> Self {
+        if DEBUG_MODE {
             let mut debug: Option<ID3D12Debug> = None;
             if let Some(debug) = D3D12GetDebugInterface(&mut debug).ok().and(debug) {
                 debug.EnableDebugLayer();
@@ -271,8 +252,8 @@ impl Tutorial {
         let dxgi_factory_flags = if cfg!(debug_assertions) { DXGI_CREATE_FACTORY_DEBUG } else { 0 };
         let dxgi_factory: IDXGIFactory4 = CreateDXGIFactory2(dxgi_factory_flags).unwrap();
         let device = create_device(dxgi_factory.clone());
-        let command_queue = create_command_queue(device.clone());
-        let swap_chain = create_dxgi_swap_chain(dxgi_factory.clone(), hwnd, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, command_queue.clone());
+        let cmd_queue = create_command_queue(device.clone());
+        let swap_chain = create_dxgi_swap_chain(dxgi_factory.clone(), hwnd, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, cmd_queue.clone());
         let mut rtv_heap = HeapData {
             heap: create_descriptor_heap(device.clone(), RTV_HEAP_SIZE, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, false),
             used_entries: 0,
@@ -291,30 +272,6 @@ impl Tutorial {
         let cmd_list: ID3D12GraphicsCommandList4 = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &frame_objects[0].cmd_allocator, None).unwrap();
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
         let fence_event: HANDLE = CreateEventW(None, false, false, None).unwrap();
-        (
-            dxgi_factory,
-            device,
-            command_queue,
-            swap_chain,
-            rtv_heap,
-            frame_objects,
-            cmd_list,
-            fence,
-            fence_event,
-        )
-    }
-    unsafe fn on_load(hwnd: HWND, width: i32, height: i32) -> Self {
-        let (
-            dxgi_factory,
-            device,
-            cmd_queue,
-            swap_chain,
-            rtv_heap,
-            frame_objects,
-            cmd_list,
-            fence,
-            fence_event,
-        ) = Self::init_dxr(hwnd, width, height);
         Self {
             hwnd,
             swap_chain_size: ivec2(width, height),
@@ -329,6 +286,9 @@ impl Tutorial {
             fence_event,
             fence_value: 0,
         }
+    }
+    unsafe fn on_load(hwnd: HWND, width: i32, height: i32) -> Self {
+        Self::init_dxr(hwnd, width, height)
     }
     unsafe fn begin_frame(&mut self) -> usize {
         self.swap_chain.GetCurrentBackBufferIndex() as usize
