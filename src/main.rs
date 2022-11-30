@@ -811,7 +811,7 @@ impl Tutorial {
             ..Default::default()
         };
 
-        // self.cmd_list.BuildRaytracingAccelerationStructure(&as_desc, None);
+        self.cmd_list.BuildRaytracingAccelerationStructure(&as_desc, None);
 
         // We need to insert a UAV barrier before using the acceleration structures in a raytracing operation
         let uav_barrier = D3D12_RESOURCE_BARRIER {
