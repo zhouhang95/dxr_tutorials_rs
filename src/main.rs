@@ -9,6 +9,7 @@ use windows::{
 
 use memoffset::offset_of;
 use glam::*;
+use once_cell::sync::Lazy;
 
 use std::mem::{size_of, size_of_val, ManuallyDrop};
 use std::ffi::c_void;
@@ -16,6 +17,20 @@ use std::ffi::c_void;
 const DEFAULT_SWAP_CHAIN_BUFFERS: u32 = 3;
 const RTV_HEAP_SIZE: u32 = 3;
 const DEBUG_MODE: bool = true;
+
+const RAY_GEN_SHADER: &str = "rayGen";
+const MISS_SHADER: &str = "miss";
+const CLOSEST_HIT_SHADER: &str = "chs";
+const HIT_GROUP: &str = "HitGroup";
+
+const W_RAY_GEN_SHADER: PCWSTR = w!("rayGen");
+const W_MISS_SHADER: PCWSTR = w!("miss");
+const W_HIT_GROUP: PCWSTR = w!("HitGroup");
+const W_CLOSEST_HIT_SHADER: PCWSTR = w!("chs");
+
+const DXC: Lazy<D3D12ShaderCompilerInfo> = Lazy::new(|| {
+    D3D12ShaderCompilerInfo::new()
+});
 
 unsafe fn msg_box(msg: &str) {
     let msg: HSTRING = msg.into();
@@ -252,6 +267,8 @@ struct Tutorial {
     tlas: Option<ID3D12Resource>,
     blas: Option<ID3D12Resource>,
     tlas_size: u64,
+    pipeline_state: Option<ID3D12StateObject>,
+    empty_root_sig: Option<ID3D12RootSignature>,
 }
 
 struct HeapData {
@@ -264,7 +281,381 @@ struct FrameObject {
     pub rtv_handle: D3D12_CPU_DESCRIPTOR_HANDLE,
 }
 
+struct PipelineConfig {
+    config: D3D12_RAYTRACING_PIPELINE_CONFIG,
+    subobject: D3D12_STATE_SUBOBJECT,
+}
+
+impl PipelineConfig {
+    unsafe fn new() -> Self {
+        Self {
+            config: std::mem::zeroed(),
+            subobject: std::mem::zeroed(),
+        }
+    }
+    unsafe fn init(&mut self, max_trace_recursion_depth: u32) {
+        self.config = D3D12_RAYTRACING_PIPELINE_CONFIG { MaxTraceRecursionDepth: max_trace_recursion_depth };
+        self.subobject = D3D12_STATE_SUBOBJECT {
+            Type: D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG,
+            pDesc: &self.config as *const _ as _,
+        };
+    }
+}
+struct ShaderConfig {
+    shader_config: D3D12_RAYTRACING_SHADER_CONFIG,
+    subobject: D3D12_STATE_SUBOBJECT,
+}
+
+impl ShaderConfig {
+    unsafe fn new() -> Self {
+        Self {
+            shader_config: std::mem::zeroed(),
+            subobject: std::mem::zeroed(),
+        }
+    }
+    unsafe fn init(&mut self, max_attribute_size_in_bytes: u32, max_payload_size_in_bytes: u32) {
+        self.shader_config = D3D12_RAYTRACING_SHADER_CONFIG {
+            MaxPayloadSizeInBytes: max_payload_size_in_bytes,
+            MaxAttributeSizeInBytes: max_attribute_size_in_bytes,
+        };
+        self.subobject = D3D12_STATE_SUBOBJECT {
+            Type: D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG,
+            pDesc: &self.shader_config as *const _ as _,
+        };
+    }
+}
+
+struct ExportAssociation {
+    subobject: D3D12_STATE_SUBOBJECT,
+    association: D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION,
+    export_names: Vec<HSTRING>,
+    export_name_ptrs: Vec<PWSTR>,
+}
+
+impl ExportAssociation {
+    unsafe fn new() -> Self {
+        Self {
+            subobject: std::mem::zeroed(),
+            association: std::mem::zeroed(),
+            export_names: Vec::new(),
+            export_name_ptrs: Vec::new(),
+        }
+    }
+    unsafe fn init(&mut self, export_names: &[String], subobject_to_associate: *const D3D12_STATE_SUBOBJECT) {
+        self.export_names = export_names.iter().map( |s| s.into()).collect();
+        for n in &self.export_names {
+            let n = PCWSTR::from(n);
+            let n: PWSTR = std::mem::transmute(n);
+            self.export_name_ptrs.push(n);
+        }
+
+        self.association.NumExports = export_names.len() as _;
+        self.association.pExports = self.export_name_ptrs.as_mut_ptr();
+        self.association.pSubobjectToAssociate = subobject_to_associate;
+
+        self.subobject.Type = D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION;
+        self.subobject.pDesc = &self.association as *const _ as _;
+    }
+}
+
+struct RootSignatureDesc {
+    desc: D3D12_ROOT_SIGNATURE_DESC,
+    range: Vec<D3D12_DESCRIPTOR_RANGE>,
+    root_params: Vec<D3D12_ROOT_PARAMETER>,
+}
+
+impl RootSignatureDesc {
+    unsafe fn new() -> Self {
+        Self {
+            desc: std::mem::zeroed(),
+            range: Vec::new(),
+            root_params: Vec::new(),
+        }
+    }
+    fn ray_gen_root_signature_desc(&mut self) {
+        // gOutput
+        self.range.push(D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        });
+
+        // gRtScene
+        self.range.push(D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 1,
+        });
+
+        // Create the desc
+        self.root_params.push(D3D12_ROOT_PARAMETER{
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                    NumDescriptorRanges: 2,
+                    pDescriptorRanges: self.range.as_ptr(),
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        });
+
+        self.desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: 1,
+            pParameters: self.root_params.as_ptr(),
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE,
+            ..Default::default()
+        };
+    }
+
+}
+
+
+unsafe fn create_root_signature(device: &ID3D12Device5, desc: &D3D12_ROOT_SIGNATURE_DESC) -> ID3D12RootSignature {
+    let mut sig_blob = None;
+    D3D12SerializeRootSignature(
+        desc as _,
+        D3D_ROOT_SIGNATURE_VERSION_1,
+        &mut sig_blob,
+        None
+    ).unwrap();
+    let sig_blob = sig_blob.unwrap();
+
+    let root_sig = device.CreateRootSignature(
+        0,
+        std::slice::from_raw_parts(
+            sig_blob.GetBufferPointer() as _,
+            sig_blob.GetBufferSize(),
+        ),
+    ).unwrap();
+    root_sig
+}
+
+struct RootSignature {
+    root_sig: ID3D12RootSignature,
+    interface: *mut c_void,
+    subobject: D3D12_STATE_SUBOBJECT,
+}
+
+impl RootSignature {
+    unsafe fn new(device: &ID3D12Device5, desc: &D3D12_ROOT_SIGNATURE_DESC) -> Self {
+        let root_sig = create_root_signature(device, desc);
+        Self {
+            root_sig,
+            interface: std::ptr::null_mut(),
+            subobject: std::mem::zeroed(),
+        }
+    }
+    fn init(&mut self, type_: D3D12_STATE_SUBOBJECT_TYPE) {
+        self.interface = self.root_sig.as_raw();
+        self.subobject.pDesc = &self.interface as *const *mut _ as _;
+        self.subobject.Type = type_;
+    }
+    fn init_local(&mut self) {
+        self.init(D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE);
+    }
+    fn init_global(&mut self) {
+        self.init(D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE);
+    }
+}
+
+struct HitProgram {
+    export_name: HSTRING,
+    desc: D3D12_HIT_GROUP_DESC,
+    subobject: D3D12_STATE_SUBOBJECT,
+}
+
+impl HitProgram {
+    unsafe fn new(name: &str) -> Self {
+        Self {
+            export_name: name.into(),
+            desc: std::mem::zeroed(),
+            subobject: std::mem::zeroed(),
+        }
+    }
+    unsafe fn init(&mut self, ahs_export: PCWSTR, chs_export: PCWSTR) {
+        self.desc = D3D12_HIT_GROUP_DESC {
+            HitGroupExport: (&self.export_name).into(),
+            AnyHitShaderImport: ahs_export,
+            ClosestHitShaderImport: chs_export,
+            ..Default::default()
+        };
+        self.subobject = D3D12_STATE_SUBOBJECT {
+            Type: D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP,
+            pDesc: &self.desc as *const _ as _,
+        };
+    }
+}
+
+struct D3D12ShaderCompilerInfo {
+    pub library: IDxcLibrary,
+    pub compiler: IDxcCompiler,
+}
+
+impl D3D12ShaderCompilerInfo {
+    fn new() -> Self {
+        Self {
+            library: unsafe { DxcCreateInstance(&CLSID_DxcLibrary).unwrap() },
+            compiler: unsafe { DxcCreateInstance(&CLSID_DxcCompiler).unwrap() },
+        }
+    }
+
+    fn compile_shader_file(&self, path: &str, entry_point: &str, target_profile: &str) -> IDxcBlob {
+        let path: HSTRING = path.into();
+        let entry_point: HSTRING = entry_point.into();
+        let target_profile: HSTRING = target_profile.into();
+        unsafe {
+            let source_blob = self.library.CreateBlobFromFile(&path, Some(&DXC_CP_UTF8)).unwrap();
+            self.compiler.Compile(
+                &source_blob,
+                &path,
+                &entry_point,
+                &target_profile,
+                None,
+                &[],
+                None
+            ).unwrap().GetResult().unwrap()
+        }
+    }
+}
+struct DxilLibrary {
+    dxil_lib_desc: D3D12_DXIL_LIBRARY_DESC,
+    state_subobject: D3D12_STATE_SUBOBJECT,
+    shader_blob: Option<IDxcBlob>,
+    export_desc: Vec<D3D12_EXPORT_DESC>,
+    export_name: Vec<HSTRING>,
+}
+
+impl DxilLibrary {
+    unsafe fn new() -> Self {
+        Self {
+            dxil_lib_desc: std::mem::zeroed(),
+            state_subobject: std::mem::zeroed(),
+            shader_blob: None,
+            export_desc: Vec::new(),
+            export_name: Vec::new(),
+        }
+    }
+    unsafe fn init(&mut self, shader_blob: IDxcBlob, export_point: &Vec<String>) {
+        self.shader_blob = Some(shader_blob);
+        self.state_subobject = D3D12_STATE_SUBOBJECT {
+            Type: D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY,
+            pDesc: &self.dxil_lib_desc as *const _ as _,
+        };
+
+        self.export_name = export_point.iter().map( |s| s.into()).collect();
+        for name in &self.export_name {
+            self.export_desc.push(D3D12_EXPORT_DESC {
+                Name: name.into(),
+                Flags: D3D12_EXPORT_FLAG_NONE,
+                ..Default::default()
+            });
+        }
+
+        self.dxil_lib_desc = D3D12_DXIL_LIBRARY_DESC {
+            DXILLibrary: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: self.shader_blob.as_ref().unwrap().GetBufferPointer(),
+                BytecodeLength: self.shader_blob.as_ref().unwrap().GetBufferSize(),
+            },
+            NumExports: export_point.len() as _,
+            pExports: self.export_desc.as_mut_ptr(),
+        };
+    }
+
+    unsafe fn create_dxil_library(&mut self) {
+        // Compile the shader
+        let dxil_lib = DXC.compile_shader_file("res/shaders.hlsl", "", "lib_6_3");
+        self.init(dxil_lib, &vec![
+            RAY_GEN_SHADER.into(),
+            MISS_SHADER.into(),
+            CLOSEST_HIT_SHADER.into(),
+        ]);
+    }
+
+}
+
 impl Tutorial {
+    unsafe fn create_rt_pipeline_state(&mut self) {
+        // Need 10 subobjects:
+        //  1 for the DXIL library
+        //  1 for hit-group
+        //  2 for RayGen root-signature (root-signature and the subobject association)
+        //  2 for the root-signature shared between miss and hit shaders (signature and association)
+        //  2 for shader config (shared between all programs. 1 for the config, 1 for association)
+        //  1 for pipeline config
+        //  1 for the global root signature
+        let mut subobjects: Vec<D3D12_STATE_SUBOBJECT> = Vec::with_capacity(64);
+
+        // Create the DXIL library
+        let mut dxil_lib = DxilLibrary::new();
+        dxil_lib.create_dxil_library();
+        subobjects.push(dxil_lib.state_subobject); // 0 Library
+
+        let mut hit_program = HitProgram::new(HIT_GROUP);
+        hit_program.init(PCWSTR::null(), W_CLOSEST_HIT_SHADER);
+        subobjects.push(hit_program.subobject); // 1 Library
+
+        // Create the ray-gen root-signature and association
+        let empty_desc = D3D12_ROOT_SIGNATURE_DESC {
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE,
+            ..Default::default()
+        };
+        let mut ray_gen_root_signature_desc = RootSignatureDesc::new();
+        ray_gen_root_signature_desc.ray_gen_root_signature_desc();
+        let mut rgs_root_signature = RootSignature::new(&self.device, &ray_gen_root_signature_desc.desc);
+        rgs_root_signature.init_local();
+        subobjects.push(rgs_root_signature.subobject); // 2 RayGen Root Sig
+
+        let mut rgs_root_association = ExportAssociation::new();
+        rgs_root_association.init(&[RAY_GEN_SHADER.into()], &subobjects[subobjects.len() - 1]);
+        subobjects.push(rgs_root_association.subobject); // 3 Associate Root Sig to RGS
+
+        // Create the miss- and hit-programs root-signature and association
+        let empty_desc = D3D12_ROOT_SIGNATURE_DESC {
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE,
+            ..Default::default()
+        };
+        let mut hit_miss_root_signature = RootSignature::new(&self.device, &empty_desc);
+        hit_miss_root_signature.init_local();
+        subobjects.push(hit_miss_root_signature.subobject); // 4 Root Sig to be shared between Miss and CHS
+
+        let mut hit_miss_root_association = ExportAssociation::new();
+        hit_miss_root_association.init(&[MISS_SHADER.into(), CLOSEST_HIT_SHADER.into()], &subobjects[subobjects.len() - 1]);
+        subobjects.push(hit_miss_root_association.subobject); // 5 Associate Root Sig to Miss and CHS
+
+        // Bind the payload size to the programs
+        let mut shader_config = ShaderConfig::new();
+        shader_config.init((size_of::<f32>() * 2) as _, (size_of::<f32>() * 1) as _);
+        subobjects.push(shader_config.subobject); // 6 Shader Config
+
+        let mut config_association = ExportAssociation::new();
+        config_association.init(&[MISS_SHADER.into(), CLOSEST_HIT_SHADER.into(), RAY_GEN_SHADER.into()], &subobjects[subobjects.len() - 1]);
+        subobjects.push(config_association.subobject); // 7 Associate Shader Config to Miss, CHS, RGS
+
+        // Create the pipeline config
+        let mut config = PipelineConfig::new();
+        config.init(0);
+        subobjects.push(config.subobject);  // 8
+
+        // Create the global root signature and store the empty signature
+        let global_desc = D3D12_ROOT_SIGNATURE_DESC::default();
+        let mut root = RootSignature::new(&self.device, &global_desc);
+        root.init_global();
+        self.empty_root_sig = Some(root.root_sig.clone());
+        subobjects.push(root.subobject); // 9
+
+        // Create the state
+        let desc = D3D12_STATE_OBJECT_DESC {
+            Type: D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+            NumSubobjects: subobjects.len() as _,
+            pSubobjects: subobjects.as_ptr(),
+        };
+
+        self.pipeline_state = Some(self.device.CreateStateObject(&desc).unwrap());
+    }
     unsafe fn create_buffer(
         &self,
         size: u64,
@@ -502,11 +893,14 @@ impl Tutorial {
             tlas: None,
             blas: None,
             tlas_size: 0,
+            pipeline_state: None,
+            empty_root_sig: None,
         }
     }
     unsafe fn on_load(hwnd: HWND, width: i32, height: i32) -> Self {
         let mut tutor = Self::init_dxr(hwnd, width, height);
         tutor.create_acceleration_structures();
+        tutor.create_rt_pipeline_state();
         tutor
     }
     unsafe fn begin_frame(&mut self) -> usize {
