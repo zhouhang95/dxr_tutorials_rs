@@ -958,6 +958,7 @@ unsafe fn unsafe_main() {
     msg_loop(&mut tutorial);
 
     // Cleanup
+    tutorial.on_shutdown();
     DestroyWindow(hwnd);
 }
 
