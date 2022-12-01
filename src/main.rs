@@ -32,6 +32,10 @@ const DXC: Lazy<D3D12ShaderCompilerInfo> = Lazy::new(|| {
     D3D12ShaderCompilerInfo::new()
 });
 
+fn align_to(alignment: u32, val: u32) -> u32 {
+    ((val + alignment - 1) / alignment) * alignment
+}
+
 unsafe fn msg_box(msg: &str) {
     let msg: HSTRING = msg.into();
     MessageBoxW(None, &msg, w!("Error"), MB_OK);
@@ -269,6 +273,8 @@ struct Tutorial {
     tlas_size: u64,
     pipeline_state: Option<ID3D12StateObject>,
     empty_root_sig: Option<ID3D12RootSignature>,
+    shader_table: Option<ID3D12Resource>,
+    shader_table_entry_size: u32,
 }
 
 struct HeapData {
@@ -578,6 +584,63 @@ impl DxilLibrary {
 }
 
 impl Tutorial {
+    unsafe fn create_shader_table(&mut self) {
+        /* The shader-table layout is as follows:
+            Entry 0 - Ray-gen program
+            Entry 1 - Miss program
+            Entry 2 - Hit program
+            All entries in the shader-table must have the same size, so we will choose it base on the largest required entry.
+            The ray-gen program requires the largest entry - sizeof(program identifier) + 8 bytes for a descriptor-table.
+            The entry size must be aligned up to D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT
+        */
+
+        // Calculate the size and create the buffer
+        self.shader_table_entry_size = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
+        self.shader_table_entry_size += 8; // The ray-gen's descriptor table
+
+        self.shader_table_entry_size = align_to(D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT, self.shader_table_entry_size);
+        let shader_table_size = self.shader_table_entry_size * 3;
+
+        // For simplicity, we create the shader-table on the upload heap. You can also create it on the default heap
+        let shader_table = self.create_buffer(shader_table_size as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &UPLOAD_HEAP_PROPS);
+
+        // Map the buffer
+        let mut data: *mut u8 = std::ptr::null_mut();
+        shader_table.Map(0, None, Some(&mut data as *mut *mut u8 as _)).unwrap();
+
+        let rtso_prop: ID3D12StateObjectProperties = self.pipeline_state.as_ref().unwrap().cast().unwrap();
+
+        // Entry 0 - ray-gen program ID and descriptor data
+        std::ptr::copy_nonoverlapping::<u8>(
+            rtso_prop.GetShaderIdentifier(W_RAY_GEN_SHADER) as _,
+            data,
+            D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _,
+        );
+
+        // This is where we need to set the descriptor data for the ray-gen shader. We'll get to it in the next tutorial
+
+        // Entry 1 - miss program
+        std::ptr::copy_nonoverlapping::<u8>(
+            rtso_prop.GetShaderIdentifier(W_MISS_SHADER) as _,
+            data.offset(self.shader_table_entry_size as _),
+            D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _,
+        );
+
+        // Entry 2 - hit program
+        let mut hit_entry = data.offset((self.shader_table_entry_size * 2) as _); // +2 skips the ray-gen and miss entries
+        std::ptr::copy_nonoverlapping::<u8>(
+            rtso_prop.GetShaderIdentifier(W_HIT_GROUP) as _,
+            hit_entry,
+            D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _,
+        );
+
+        // Unmap
+        shader_table.Unmap(0, None);
+
+        // move
+        self.shader_table = Some(shader_table);
+
+    }
     unsafe fn create_rt_pipeline_state(&mut self) {
         // Need 10 subobjects:
         //  1 for the DXIL library
@@ -895,12 +958,15 @@ impl Tutorial {
             tlas_size: 0,
             pipeline_state: None,
             empty_root_sig: None,
+            shader_table: None,
+            shader_table_entry_size: 0,
         }
     }
     unsafe fn on_load(hwnd: HWND, width: i32, height: i32) -> Self {
         let mut tutor = Self::init_dxr(hwnd, width, height);
         tutor.create_acceleration_structures();
         tutor.create_rt_pipeline_state();
+        tutor.create_shader_table();
         tutor
     }
     unsafe fn begin_frame(&mut self) -> usize {
