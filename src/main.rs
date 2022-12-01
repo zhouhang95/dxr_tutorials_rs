@@ -16,6 +16,8 @@ use std::ffi::c_void;
 
 const DEFAULT_SWAP_CHAIN_BUFFERS: u32 = 3;
 const RTV_HEAP_SIZE: u32 = 3;
+const SRV_UAV_HEAP_SIZE: u32 = 2;
+
 const DEBUG_MODE: bool = true;
 
 const RAY_GEN_SHADER: &str = "rayGen";
@@ -194,7 +196,7 @@ unsafe fn create_dxgi_swap_chain(factory: IDXGIFactory4, hwnd: HWND, width: i32,
     .unwrap()
 }
 
-unsafe fn create_descriptor_heap(device: ID3D12Device5, count: u32, heap_type: D3D12_DESCRIPTOR_HEAP_TYPE, shader_visible: bool) -> ID3D12DescriptorHeap {
+unsafe fn create_descriptor_heap(device: &ID3D12Device5, count: u32, heap_type: D3D12_DESCRIPTOR_HEAP_TYPE, shader_visible: bool) -> ID3D12DescriptorHeap {
     let mut desc = D3D12_DESCRIPTOR_HEAP_DESC::default();
     desc.NumDescriptors = count;
     desc.Type = heap_type;
@@ -212,20 +214,6 @@ unsafe fn create_rtv(device: ID3D12Device5, resource: &ID3D12Resource, rtv_heap:
     rtv_heap.used_entries += 1;
     device.CreateRenderTargetView(resource, Some(&desc), rtv_handle);
     rtv_handle
-}
-
-unsafe fn resource_barrier(cmd_list: ID3D12GraphicsCommandList4, resource: ID3D12Resource, state_before: D3D12_RESOURCE_STATES, state_after: D3D12_RESOURCE_STATES) {
-    let mut barrier = D3D12_RESOURCE_BARRIER::default();
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Anonymous = D3D12_RESOURCE_BARRIER_0 {
-        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-            pResource: Some(resource.clone()),
-            StateBefore: state_before,
-            StateAfter: state_after,
-            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-        })
-    };
-    cmd_list.ResourceBarrier(&[barrier]);
 }
 
 const UPLOAD_HEAP_PROPS: D3D12_HEAP_PROPERTIES  = D3D12_HEAP_PROPERTIES {
@@ -275,6 +263,8 @@ struct Tutorial {
     empty_root_sig: Option<ID3D12RootSignature>,
     shader_table: Option<ID3D12Resource>,
     shader_table_entry_size: u32,
+    output_resource: Option<ID3D12Resource>,
+    srv_uav_heap: Option<ID3D12DescriptorHeap>,
 }
 
 struct HeapData {
@@ -584,6 +574,19 @@ impl DxilLibrary {
 }
 
 impl Tutorial {
+    unsafe fn resource_barrier(&self, resource: ID3D12Resource, state_before: D3D12_RESOURCE_STATES, state_after: D3D12_RESOURCE_STATES) {
+        let mut barrier = D3D12_RESOURCE_BARRIER::default();
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Anonymous = D3D12_RESOURCE_BARRIER_0 {
+            Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                pResource: Some(resource.clone()),
+                StateBefore: state_before,
+                StateAfter: state_after,
+                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            })
+        };
+        self.cmd_list.ResourceBarrier(&[barrier]);
+    }
     unsafe fn create_shader_table(&mut self) {
         /* The shader-table layout is as follows:
             Entry 0 - Ray-gen program
@@ -617,7 +620,10 @@ impl Tutorial {
             D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _,
         );
 
-        // This is where we need to set the descriptor data for the ray-gen shader. We'll get to it in the next tutorial
+        // This is where we need to set the descriptor data for the ray-gen shader.
+        let heap_start = self.srv_uav_heap.as_ref().unwrap().GetGPUDescriptorHandleForHeapStart().ptr;
+        let ptr = data.offset(D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _) as *mut u64;
+        *ptr = heap_start;
 
         // Entry 1 - miss program
         std::ptr::copy_nonoverlapping::<u8>(
@@ -922,7 +928,7 @@ impl Tutorial {
         let cmd_queue = create_command_queue(device.clone());
         let swap_chain = create_dxgi_swap_chain(dxgi_factory.clone(), hwnd, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, cmd_queue.clone());
         let mut rtv_heap = HeapData {
-            heap: create_descriptor_heap(device.clone(), RTV_HEAP_SIZE, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, false),
+            heap: create_descriptor_heap(&device, RTV_HEAP_SIZE, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, false),
             used_entries: 0,
         };
 
@@ -960,12 +966,15 @@ impl Tutorial {
             empty_root_sig: None,
             shader_table: None,
             shader_table_entry_size: 0,
+            output_resource: None,
+            srv_uav_heap: None,
         }
     }
     unsafe fn on_load(hwnd: HWND, width: i32, height: i32) -> Self {
         let mut tutor = Self::init_dxr(hwnd, width, height);
         tutor.create_acceleration_structures();
         tutor.create_rt_pipeline_state();
+        tutor.create_shader_resources();
         tutor.create_shader_table();
         tutor
     }
@@ -973,7 +982,7 @@ impl Tutorial {
         self.swap_chain.GetCurrentBackBufferIndex() as usize
     }
     unsafe fn end_frame(&mut self, rtv_index: usize) {
-        resource_barrier(self.cmd_list.clone(), self.frame_objects[rtv_index].swap_chain_buffer.clone(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+        self.resource_barrier(self.frame_objects[rtv_index].swap_chain_buffer.clone(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
         self.submit_cmd_list();
         self.swap_chain.Present(0, 0).unwrap();
 
@@ -991,9 +1000,44 @@ impl Tutorial {
     }
     unsafe fn on_frame_render(&mut self) {
         let rtv_index: usize = self.begin_frame();
-        let clear_color: [f32; 4] = vec4(0.4, 0.6, 0.2, 1.0).into();
-        resource_barrier(self.cmd_list.clone(), self.frame_objects[rtv_index].swap_chain_buffer.clone(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        self.cmd_list.ClearRenderTargetView(self.frame_objects[rtv_index].rtv_handle, clear_color.as_ptr(), &[]);
+
+        // Let's raytrace
+        self.resource_barrier(self.output_resource.clone().unwrap(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        let st_gpu_address = self.shader_table.as_ref().unwrap().GetGPUVirtualAddress();
+        let raytrace_desc = D3D12_DISPATCH_RAYS_DESC {
+            // RayGen is the first entry in the shader-table
+            RayGenerationShaderRecord: D3D12_GPU_VIRTUAL_ADDRESS_RANGE {
+                StartAddress: st_gpu_address,
+                SizeInBytes: self.shader_table_entry_size as u64,
+            },
+            MissShaderTable: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
+                StartAddress: st_gpu_address + 1 * self.shader_table_entry_size as u64,
+                SizeInBytes: self.shader_table_entry_size as u64, // Only a s single miss-entry
+                StrideInBytes: self.shader_table_entry_size as u64,
+            },
+            HitGroupTable: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
+                StartAddress: st_gpu_address + 2 * self.shader_table_entry_size as u64,
+                SizeInBytes: self.shader_table_entry_size as u64,
+                StrideInBytes: self.shader_table_entry_size as u64,
+            },
+            Width: self.swap_chain_size.x as _,
+            Height: self.swap_chain_size.y as _,
+            Depth: 1,
+            ..Default::default()
+        };
+
+        // Bind the empty root signature
+        self.cmd_list.SetComputeRootSignature(self.empty_root_sig.as_ref().unwrap());
+
+        // Dispatch
+        self.cmd_list.SetPipelineState1(self.pipeline_state.as_ref().unwrap());
+        self.cmd_list.DispatchRays(&raytrace_desc);
+
+        // Copy the results to the back-buffer
+        self.resource_barrier(self.output_resource.clone().unwrap(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        self.resource_barrier(self.frame_objects[rtv_index].swap_chain_buffer.clone(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+        self.cmd_list.CopyResource(&self.frame_objects[rtv_index].swap_chain_buffer, self.output_resource.as_ref().unwrap());
+
         self.end_frame(rtv_index);
     }
     unsafe fn on_shutdown(&mut self) {
@@ -1002,6 +1046,62 @@ impl Tutorial {
         self.cmd_queue.Signal(&self.fence, self.fence_value).unwrap();
         self.fence.SetEventOnCompletion(self.fence_value, self.fence_event).unwrap();
         WaitForSingleObject(self.fence_event, INFINITE);
+    }
+
+    unsafe fn create_shader_resources(&mut self) {
+        // Create the output resource. The dimensions and format should match the swap-chain
+        let res_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: self.swap_chain_size.x as _,
+            Height: self.swap_chain_size.y as _,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM, // The backbuffer is actually DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, but sRGB formats can't be used with UAVs. We will convert to sRGB ourselves in the shader
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        };
+        let mut output_resource: Option<ID3D12Resource> = None;
+        self.device.CreateCommittedResource(
+            &DEFAULT_HEAP_PROPS,
+            D3D12_HEAP_FLAG_NONE,
+            &res_desc,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            None,
+            &mut output_resource).unwrap();
+
+        // Create an SRV/UAV descriptor heap. Need 2 entries - 1 SRV for the scene and 1 UAV for the output
+        let srv_uav_heap = create_descriptor_heap(&self.device, 2, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, true);
+
+        // Create the UAV. Based on the root signature we created it should be the first entry
+        let uav_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        self.device.CreateUnorderedAccessView(
+            output_resource.as_ref().unwrap(),
+            None,
+            Some(&uav_desc),
+            srv_uav_heap.GetCPUDescriptorHandleForHeapStart());
+
+        // Create the TLAS SRV right after the UAV. Note that we are using a different SRV desc here
+        let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                RaytracingAccelerationStructure: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_SRV {
+                    Location: self.tlas.as_ref().unwrap().GetGPUVirtualAddress(),
+                },
+            },
+        };
+        let mut srv_handle = srv_uav_heap.GetCPUDescriptorHandleForHeapStart();
+        srv_handle.ptr += self.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+        self.device.CreateShaderResourceView(None, Some(&srv_desc), srv_handle);
+
+        self.output_resource = output_resource;
+        self.srv_uav_heap = Some(srv_uav_heap);
     }
 }
 
