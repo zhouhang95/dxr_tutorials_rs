@@ -34,6 +34,15 @@ const DXC: Lazy<D3D12ShaderCompilerInfo> = Lazy::new(|| {
     D3D12ShaderCompilerInfo::new()
 });
 
+
+unsafe fn memcpy<T, U>(dst: *mut T, src: *const U, count: usize) {
+    std::ptr::copy_nonoverlapping::<u8>(
+        src as *const _,
+        dst as *mut _,
+        count,
+    );
+}
+
 fn align_to(alignment: u32, val: u32) -> u32 {
     ((val + alignment - 1) / alignment) * alignment
 }
@@ -614,11 +623,7 @@ impl Tutorial {
         let rtso_prop: ID3D12StateObjectProperties = self.pipeline_state.as_ref().unwrap().cast().unwrap();
 
         // Entry 0 - ray-gen program ID and descriptor data
-        std::ptr::copy_nonoverlapping::<u8>(
-            rtso_prop.GetShaderIdentifier(W_RAY_GEN_SHADER) as _,
-            data,
-            D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _,
-        );
+        memcpy(data, rtso_prop.GetShaderIdentifier(W_RAY_GEN_SHADER), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
 
         // This is where we need to set the descriptor data for the ray-gen shader.
         let heap_start = self.srv_uav_heap.as_ref().unwrap().GetGPUDescriptorHandleForHeapStart().ptr;
@@ -626,19 +631,11 @@ impl Tutorial {
         *ptr = heap_start;
 
         // Entry 1 - miss program
-        std::ptr::copy_nonoverlapping::<u8>(
-            rtso_prop.GetShaderIdentifier(W_MISS_SHADER) as _,
-            data.offset(self.shader_table_entry_size as _),
-            D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _,
-        );
+        memcpy(data.offset(self.shader_table_entry_size as _), rtso_prop.GetShaderIdentifier(W_MISS_SHADER), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
 
         // Entry 2 - hit program
         let mut hit_entry = data.offset((self.shader_table_entry_size * 2) as _); // +2 skips the ray-gen and miss entries
-        std::ptr::copy_nonoverlapping::<u8>(
-            rtso_prop.GetShaderIdentifier(W_HIT_GROUP) as _,
-            hit_entry,
-            D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _,
-        );
+        memcpy(hit_entry, rtso_prop.GetShaderIdentifier(W_HIT_GROUP), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
 
         // Unmap
         shader_table.Unmap(0, None);
@@ -765,11 +762,7 @@ impl Tutorial {
         let vertex_buffer = self.create_buffer(size_of_val(&vertices) as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &UPLOAD_HEAP_PROPS);
         let mut data = std::ptr::null_mut();
         vertex_buffer.Map(0, None, Some(&mut data)).unwrap();
-        std::ptr::copy_nonoverlapping(
-            vertices.as_ptr(),
-            data as _,
-            vertices.len(),
-        );
+        memcpy(data, vertices.as_ptr(), size_of_val(&vertices));
         vertex_buffer.Unmap(0, None);
         vertex_buffer
     }
@@ -857,11 +850,7 @@ impl Tutorial {
 
         // Initialize the instance desc. We only have a single instance
         let m = Mat4::IDENTITY;
-        std::ptr::copy_nonoverlapping::<f32>(
-            m.as_ref() as _,
-            (*instance_desc).Transform.as_mut_ptr() as _,
-            (*instance_desc).Transform.len(),
-        );
+        memcpy((*instance_desc).Transform.as_mut_ptr(), m.as_ref(), size_of_val(&((*instance_desc).Transform)));
         (*instance_desc).AccelerationStructure = blas.GetGPUVirtualAddress();
         (*instance_desc)._bitfield1 = 0xFF000000;
         (*instance_desc)._bitfield2 = 0;
