@@ -968,6 +968,8 @@ impl Tutorial {
         tutor
     }
     unsafe fn begin_frame(&mut self) -> usize {
+        // Bind the descriptor heaps
+        self.cmd_list.SetDescriptorHeaps(&[self.srv_uav_heap.clone()]);
         self.swap_chain.GetCurrentBackBufferIndex() as usize
     }
     unsafe fn end_frame(&mut self, rtv_index: usize) {
