@@ -274,6 +274,7 @@ struct Tutorial {
     shader_table_entry_size: u32,
     output_resource: Option<ID3D12Resource>,
     srv_uav_heap: Option<ID3D12DescriptorHeap>,
+    constant_buffer: Option<ID3D12Resource>,
 }
 
 struct HeapData {
@@ -403,6 +404,25 @@ impl RootSignatureDesc {
                 DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
                     NumDescriptorRanges: 2,
                     pDescriptorRanges: self.range.as_ptr(),
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        });
+
+        self.desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: 1,
+            pParameters: self.root_params.as_ptr(),
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE,
+            ..Default::default()
+        };
+    }
+    fn hit_root_desc(&mut self) {
+        self.root_params.push(D3D12_ROOT_PARAMETER{
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
                 },
             },
             ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
@@ -633,9 +653,13 @@ impl Tutorial {
         // Entry 1 - miss program
         memcpy(data.offset(self.shader_table_entry_size as _), rtso_prop.GetShaderIdentifier(W_MISS_SHADER), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
 
-        // Entry 2 - hit program
+        // Entry 2 - hit program. Program ID and one constant-buffer as root descriptor
         let mut hit_entry = data.offset((self.shader_table_entry_size * 2) as _); // +2 skips the ray-gen and miss entries
         memcpy(hit_entry, rtso_prop.GetShaderIdentifier(W_HIT_GROUP), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
+        let cb_desc = hit_entry.offset(D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _); // Adding `progIdSize` gets us to the location of the constant-buffer entry
+        assert!( cb_desc as usize % 8 == 0); // Root descriptor must be stored at an 8-byte aligned address
+        let cb_desc: *mut u64 = cb_desc as _;
+        *cb_desc = self.constant_buffer.as_ref().unwrap().GetGPUVirtualAddress();
 
         // Unmap
         shader_table.Unmap(0, None);
@@ -645,11 +669,12 @@ impl Tutorial {
 
     }
     unsafe fn create_rt_pipeline_state(&mut self) {
-        // Need 10 subobjects:
+        // Need 12 subobjects:
         //  1 for the DXIL library
         //  1 for hit-group
         //  2 for RayGen root-signature (root-signature and the subobject association)
-        //  2 for the root-signature shared between miss and hit shaders (signature and association)
+        //  2 for hit-program root-signature (root-signature and the subobject association)
+        //  2 for miss-shader root-signature (signature and association)
         //  2 for shader config (shared between all programs. 1 for the config, 1 for association)
         //  1 for pipeline config
         //  1 for the global root signature
@@ -665,10 +690,6 @@ impl Tutorial {
         subobjects.push(hit_program.subobject); // 1 Library
 
         // Create the ray-gen root-signature and association
-        let empty_desc = D3D12_ROOT_SIGNATURE_DESC {
-            Flags: D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE,
-            ..Default::default()
-        };
         let mut ray_gen_root_signature_desc = RootSignatureDesc::new();
         ray_gen_root_signature_desc.ray_gen_root_signature_desc();
         let mut rgs_root_signature = RootSignature::new(&self.device, &ray_gen_root_signature_desc.desc);
@@ -679,39 +700,50 @@ impl Tutorial {
         rgs_root_association.init(&[RAY_GEN_SHADER.into()], &subobjects[subobjects.len() - 1]);
         subobjects.push(rgs_root_association.subobject); // 3 Associate Root Sig to RGS
 
-        // Create the miss- and hit-programs root-signature and association
+        // Create the hit root-signature and association
+        let mut hit_root_desc = RootSignatureDesc::new();
+        hit_root_desc.hit_root_desc();
+        let mut hit_root_signature = RootSignature::new(&self.device, &hit_root_desc.desc);
+        hit_root_signature.init_local();
+        subobjects.push(hit_root_signature.subobject); // 4 Hit Root Sig
+
+        let mut hit_root_association = ExportAssociation::new();
+        hit_root_association.init(&[CLOSEST_HIT_SHADER.into()], &subobjects[subobjects.len() - 1]);
+        subobjects.push(hit_root_association.subobject); // 5 Associate Hit Root Sig to Hit Group
+
+        // Create the miss root-signature and association
         let empty_desc = D3D12_ROOT_SIGNATURE_DESC {
             Flags: D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE,
             ..Default::default()
         };
-        let mut hit_miss_root_signature = RootSignature::new(&self.device, &empty_desc);
-        hit_miss_root_signature.init_local();
-        subobjects.push(hit_miss_root_signature.subobject); // 4 Root Sig to be shared between Miss and CHS
+        let mut miss_root_signature = RootSignature::new(&self.device, &empty_desc);
+        miss_root_signature.init_local();
+        subobjects.push(miss_root_signature.subobject); // 6 Miss Root Sig
 
-        let mut hit_miss_root_association = ExportAssociation::new();
-        hit_miss_root_association.init(&[MISS_SHADER.into(), CLOSEST_HIT_SHADER.into()], &subobjects[subobjects.len() - 1]);
-        subobjects.push(hit_miss_root_association.subobject); // 5 Associate Root Sig to Miss and CHS
+        let mut miss_root_association = ExportAssociation::new();
+        miss_root_association.init(&[MISS_SHADER.into()], &subobjects[subobjects.len() - 1]);
+        subobjects.push(miss_root_association.subobject); // 7 Associate Miss Root Sig to Miss Shader
 
         // Bind the payload size to the programs
         let mut shader_config = ShaderConfig::new();
         shader_config.init((size_of::<f32>() * 2) as _, (size_of::<f32>() * 3) as _);
-        subobjects.push(shader_config.subobject); // 6 Shader Config
+        subobjects.push(shader_config.subobject); // 8 Shader Config
 
         let mut config_association = ExportAssociation::new();
         config_association.init(&[MISS_SHADER.into(), CLOSEST_HIT_SHADER.into(), RAY_GEN_SHADER.into()], &subobjects[subobjects.len() - 1]);
-        subobjects.push(config_association.subobject); // 7 Associate Shader Config to Miss, CHS, RGS
+        subobjects.push(config_association.subobject); // 9 Associate Shader Config to Miss, CHS, RGS
 
         // Create the pipeline config
         let mut config = PipelineConfig::new();
         config.init(1);
-        subobjects.push(config.subobject);  // 8
+        subobjects.push(config.subobject);  // 10
 
         // Create the global root signature and store the empty signature
         let global_desc = D3D12_ROOT_SIGNATURE_DESC::default();
         let mut root = RootSignature::new(&self.device, &global_desc);
         root.init_global();
         self.empty_root_sig = Some(root.root_sig.clone());
-        subobjects.push(root.subobject); // 9
+        subobjects.push(root.subobject); // 11
 
         // Create the state
         let desc = D3D12_STATE_OBJECT_DESC {
@@ -965,6 +997,7 @@ impl Tutorial {
             shader_table_entry_size: 0,
             output_resource: None,
             srv_uav_heap: None,
+            constant_buffer: None,
         }
     }
     unsafe fn on_load(hwnd: HWND, width: i32, height: i32) -> Self {
@@ -972,8 +1005,35 @@ impl Tutorial {
         tutor.create_acceleration_structures();
         tutor.create_rt_pipeline_state();
         tutor.create_shader_resources();
+        tutor.create_constant_buffer();
         tutor.create_shader_table();
         tutor
+    }
+    unsafe fn create_constant_buffer(&mut self) {
+        // The shader declares the CB with 9 float3. However, due to HLSL packing rules, we create the CB with 9 float4 (each float3 needs to start on a 16-byte boundary)
+        let buffer_data = [
+            // A
+            vec4(1.0, 0.0, 0.0, 1.0),
+            vec4(0.0, 1.0, 0.0, 1.0),
+            vec4(0.0, 0.0, 1.0, 1.0),
+
+            // B
+            vec4(1.0, 1.0, 0.0, 1.0),
+            vec4(0.0, 1.0, 1.0, 1.0),
+            vec4(1.0, 0.0, 1.0, 1.0),
+
+            // C
+            vec4(1.0, 0.0, 1.0, 1.0),
+            vec4(1.0, 1.0, 0.0, 1.0),
+            vec4(0.0, 1.0, 1.0, 1.0),
+        ];
+
+        let constant_buffer = self.create_buffer(size_of_val(&buffer_data) as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &UPLOAD_HEAP_PROPS);
+        let mut data = std::ptr::null_mut();
+        constant_buffer.Map(0, None, Some(&mut data)).unwrap();
+        memcpy(data, buffer_data.as_ptr(), size_of_val(&buffer_data));
+        constant_buffer.Unmap(0, None);
+        self.constant_buffer = Some(constant_buffer);
     }
     unsafe fn begin_frame(&mut self) -> usize {
         // Bind the descriptor heaps
