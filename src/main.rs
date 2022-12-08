@@ -7,7 +7,6 @@ use windows::{
     Win32::System::WindowsProgramming::*, Win32::UI::WindowsAndMessaging::*,
 };
 
-use memoffset::offset_of;
 use glam::*;
 use once_cell::sync::Lazy;
 
@@ -274,7 +273,7 @@ struct Tutorial {
     shader_table_entry_size: u32,
     output_resource: Option<ID3D12Resource>,
     srv_uav_heap: Option<ID3D12DescriptorHeap>,
-    constant_buffer: Option<ID3D12Resource>,
+    constant_buffers: Vec<ID3D12Resource>,
 }
 
 struct HeapData {
@@ -620,18 +619,20 @@ impl Tutorial {
         /* The shader-table layout is as follows:
             Entry 0 - Ray-gen program
             Entry 1 - Miss program
-            Entry 2 - Hit program
+            Entry 2 - Hit program for triangle 0 and plane
+            Entry 3 - Hit program for triangle 1
+            Entry 4 - Hit program for triangle 2
             All entries in the shader-table must have the same size, so we will choose it base on the largest required entry.
-            The ray-gen program requires the largest entry - sizeof(program identifier) + 8 bytes for a descriptor-table.
+            The hit program requires the largest entry - sizeof(program identifier) + 8 bytes for a descriptor-table.
             The entry size must be aligned up to D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT
         */
 
         // Calculate the size and create the buffer
         self.shader_table_entry_size = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
-        self.shader_table_entry_size += 8; // The ray-gen's descriptor table
+        self.shader_table_entry_size += 8; // The hit shader constant-buffer descriptor
 
         self.shader_table_entry_size = align_to(D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT, self.shader_table_entry_size);
-        let shader_table_size = self.shader_table_entry_size * 3;
+        let shader_table_size = self.shader_table_entry_size * 5;
 
         // For simplicity, we create the shader-table on the upload heap. You can also create it on the default heap
         let shader_table = self.create_buffer(shader_table_size as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &UPLOAD_HEAP_PROPS);
@@ -653,13 +654,15 @@ impl Tutorial {
         // Entry 1 - miss program
         memcpy(data.offset(self.shader_table_entry_size as _), rtso_prop.GetShaderIdentifier(W_MISS_SHADER), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
 
-        // Entry 2 - hit program. Program ID and one constant-buffer as root descriptor
-        let mut hit_entry = data.offset((self.shader_table_entry_size * 2) as _); // +2 skips the ray-gen and miss entries
-        memcpy(hit_entry, rtso_prop.GetShaderIdentifier(W_HIT_GROUP), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
-        let cb_desc = hit_entry.offset(D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _); // Adding `progIdSize` gets us to the location of the constant-buffer entry
-        assert!( cb_desc as usize % 8 == 0); // Root descriptor must be stored at an 8-byte aligned address
-        let cb_desc: *mut u64 = cb_desc as _;
-        *cb_desc = self.constant_buffer.as_ref().unwrap().GetGPUVirtualAddress();
+        // Entry 2-4 - hit program. Program ID and one constant-buffer as root descriptor
+        for i in 0..3 {
+            let hit_entry = data.offset(self.shader_table_entry_size as isize * (2 + i)); // +2 skips the ray-gen and miss entries
+            memcpy(hit_entry, rtso_prop.GetShaderIdentifier(W_HIT_GROUP), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
+            let cb_desc = hit_entry.offset(D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _); // The location of the root-descriptor
+            assert!( cb_desc as usize % 8 == 0); // Root descriptor must be stored at an 8-byte aligned address
+            let cb_desc: *mut u64 = cb_desc as _;
+            *cb_desc = self.constant_buffers[i as usize].GetGPUVirtualAddress();
+        }
 
         // Unmap
         shader_table.Unmap(0, None);
@@ -868,7 +871,7 @@ impl Tutorial {
         self.device.GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &mut info);
 
         // Create the buffers
-        let mut buffers = TLASBuffers {
+        let buffers = TLASBuffers {
             scratch: self.create_buffer(info.ScratchDataSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &DEFAULT_HEAP_PROPS),
             result: self.create_buffer(info.ResultDataMaxSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, &DEFAULT_HEAP_PROPS),
             instance_desc: self.create_buffer(3 * size_of::<D3D12_RAYTRACING_INSTANCE_DESC>() as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &UPLOAD_HEAP_PROPS),
@@ -892,7 +895,7 @@ impl Tutorial {
             memcpy((*instance_desc).Transform.as_mut_ptr(), m.as_ref(), size_of_val(&((*instance_desc).Transform)));
             (*instance_desc).AccelerationStructure = blas.GetGPUVirtualAddress();
             (*instance_desc)._bitfield1 = 0xFF000000 | (i as u32);
-            (*instance_desc)._bitfield2 = 0;
+            (*instance_desc)._bitfield2 = i as u32;
         }
 
         // Unmap
@@ -997,7 +1000,7 @@ impl Tutorial {
             shader_table_entry_size: 0,
             output_resource: None,
             srv_uav_heap: None,
-            constant_buffer: None,
+            constant_buffers: Vec::new(),
         }
     }
     unsafe fn on_load(hwnd: HWND, width: i32, height: i32) -> Self {
@@ -1005,35 +1008,38 @@ impl Tutorial {
         tutor.create_acceleration_structures();
         tutor.create_rt_pipeline_state();
         tutor.create_shader_resources();
-        tutor.create_constant_buffer();
+        tutor.create_constant_buffers();
         tutor.create_shader_table();
         tutor
     }
-    unsafe fn create_constant_buffer(&mut self) {
+    unsafe fn create_constant_buffers(&mut self) {
         // The shader declares the CB with 9 float3. However, due to HLSL packing rules, we create the CB with 9 float4 (each float3 needs to start on a 16-byte boundary)
         let buffer_data = [
-            // A
+            // Instance 0
             vec4(1.0, 0.0, 0.0, 1.0),
+            vec4(1.0, 1.0, 0.0, 1.0),
+            vec4(1.0, 0.0, 1.0, 1.0),
+
+            // Instance 1
             vec4(0.0, 1.0, 0.0, 1.0),
-            vec4(0.0, 0.0, 1.0, 1.0),
-
-            // B
-            vec4(1.0, 1.0, 0.0, 1.0),
             vec4(0.0, 1.0, 1.0, 1.0),
-            vec4(1.0, 0.0, 1.0, 1.0),
-
-            // C
-            vec4(1.0, 0.0, 1.0, 1.0),
             vec4(1.0, 1.0, 0.0, 1.0),
+
+            // Instance 2
+            vec4(0.0, 0.0, 1.0, 1.0),
+            vec4(1.0, 0.0, 1.0, 1.0),
             vec4(0.0, 1.0, 1.0, 1.0),
         ];
-
-        let constant_buffer = self.create_buffer(size_of_val(&buffer_data) as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &UPLOAD_HEAP_PROPS);
-        let mut data = std::ptr::null_mut();
-        constant_buffer.Map(0, None, Some(&mut data)).unwrap();
-        memcpy(data, buffer_data.as_ptr(), size_of_val(&buffer_data));
-        constant_buffer.Unmap(0, None);
-        self.constant_buffer = Some(constant_buffer);
+        
+        for i in 0..3 {
+            let buffer_size = size_of::<Vec4>() * 3;
+            let constant_buffer = self.create_buffer(buffer_size as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &UPLOAD_HEAP_PROPS);
+            let mut data = std::ptr::null_mut();
+            constant_buffer.Map(0, None, Some(&mut data)).unwrap();
+            memcpy(data, buffer_data.as_ptr().offset(i * 3), size_of_val(&buffer_data));
+            constant_buffer.Unmap(0, None);
+            self.constant_buffers.push(constant_buffer);
+        }
     }
     unsafe fn begin_frame(&mut self) -> usize {
         // Bind the descriptor heaps
@@ -1076,7 +1082,7 @@ impl Tutorial {
             },
             HitGroupTable: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
                 StartAddress: st_gpu_address + 2 * self.shader_table_entry_size as u64,
-                SizeInBytes: self.shader_table_entry_size as u64,
+                SizeInBytes: self.shader_table_entry_size as u64 * 3,
                 StrideInBytes: self.shader_table_entry_size as u64,
             },
             Width: self.swap_chain_size.x as _,
