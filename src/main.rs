@@ -828,7 +828,7 @@ impl Tutorial {
         let mut inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
             Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
             Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE,
-            NumDescs: 1,
+            NumDescs: 3,
             DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
             ..Default::default()
         };
@@ -839,7 +839,7 @@ impl Tutorial {
         let mut buffers = TLASBuffers {
             scratch: self.create_buffer(info.ScratchDataSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &DEFAULT_HEAP_PROPS),
             result: self.create_buffer(info.ResultDataMaxSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, &DEFAULT_HEAP_PROPS),
-            instance_desc: self.create_buffer(size_of::<D3D12_RAYTRACING_INSTANCE_DESC>() as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &UPLOAD_HEAP_PROPS),
+            instance_desc: self.create_buffer(3 * size_of::<D3D12_RAYTRACING_INSTANCE_DESC>() as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &UPLOAD_HEAP_PROPS),
         };
         self.tlas_size = info.ResultDataMaxSizeInBytes;
 
@@ -849,11 +849,19 @@ impl Tutorial {
         let instance_desc: *mut D3D12_RAYTRACING_INSTANCE_DESC = instance_desc as _;
 
         // Initialize the instance desc. We only have a single instance
-        let m = Mat4::IDENTITY;
-        memcpy((*instance_desc).Transform.as_mut_ptr(), m.as_ref(), size_of_val(&((*instance_desc).Transform)));
-        (*instance_desc).AccelerationStructure = blas.GetGPUVirtualAddress();
-        (*instance_desc)._bitfield1 = 0xFF000000;
-        (*instance_desc)._bitfield2 = 0;
+        let ms = [
+            Mat4::IDENTITY,
+            Mat4::from_translation(vec3(-2.0, 0.0, 0.0)),
+            Mat4::from_translation(vec3(2.0, 0.0, 0.0)),
+        ];
+        for (i, m) in ms.iter().enumerate() {
+            let instance_desc = instance_desc.offset(i as _);
+            let m = m.transpose();
+            memcpy((*instance_desc).Transform.as_mut_ptr(), m.as_ref(), size_of_val(&((*instance_desc).Transform)));
+            (*instance_desc).AccelerationStructure = blas.GetGPUVirtualAddress();
+            (*instance_desc)._bitfield1 = 0xFF000000 | (i as u32);
+            (*instance_desc)._bitfield2 = 0;
+        }
 
         // Unmap
         buffers.instance_desc.Unmap(0, None);
