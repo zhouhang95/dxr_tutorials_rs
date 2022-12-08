@@ -694,7 +694,7 @@ impl Tutorial {
 
         // Bind the payload size to the programs
         let mut shader_config = ShaderConfig::new();
-        shader_config.init((size_of::<f32>() * 2) as _, (size_of::<f32>() * 1) as _);
+        shader_config.init((size_of::<f32>() * 2) as _, (size_of::<f32>() * 3) as _);
         subobjects.push(shader_config.subobject); // 6 Shader Config
 
         let mut config_association = ExportAssociation::new();
@@ -703,7 +703,7 @@ impl Tutorial {
 
         // Create the pipeline config
         let mut config = PipelineConfig::new();
-        config.init(0);
+        config.init(1);
         subobjects.push(config.subobject);  // 8
 
         // Create the global root signature and store the empty signature
