@@ -21,13 +21,17 @@ const DEBUG_MODE: bool = true;
 
 const RAY_GEN_SHADER: &str = "rayGen";
 const MISS_SHADER: &str = "miss";
-const CLOSEST_HIT_SHADER: &str = "chs";
-const HIT_GROUP: &str = "HitGroup";
+const TRIANGLE_CHS: &str = "triangleChs";
+const PLANE_CHS: &str = "planeChs";
+const TRI_HIT_GROUP: &str = "TriHitGroup";
+const PLANE_HIT_GROUP: &str = "PlaneHitGroup";
 
 const W_RAY_GEN_SHADER: PCWSTR = w!("rayGen");
 const W_MISS_SHADER: PCWSTR = w!("miss");
-const W_HIT_GROUP: PCWSTR = w!("HitGroup");
-const W_CLOSEST_HIT_SHADER: PCWSTR = w!("chs");
+const W_TRIANGLE_CHS: PCWSTR = w!("triangleChs");
+const W_PLANE_CHS: PCWSTR = w!("planeChs");
+const W_TRI_HIT_GROUP: PCWSTR = w!("TriHitGroup");
+const W_PLANE_HIT_GROUP: PCWSTR = w!("PlaneHitGroup");
 
 const DXC: Lazy<D3D12ShaderCompilerInfo> = Lazy::new(|| {
     D3D12ShaderCompilerInfo::new()
@@ -415,7 +419,7 @@ impl RootSignatureDesc {
             ..Default::default()
         };
     }
-    fn hit_root_desc(&mut self) {
+    fn triangle_hit_root_desc(&mut self) {
         self.root_params.push(D3D12_ROOT_PARAMETER{
             ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
             Anonymous: D3D12_ROOT_PARAMETER_0 {
@@ -595,7 +599,8 @@ impl DxilLibrary {
         self.init(dxil_lib, &vec![
             RAY_GEN_SHADER.into(),
             MISS_SHADER.into(),
-            CLOSEST_HIT_SHADER.into(),
+            PLANE_CHS.into(),
+            TRIANGLE_CHS.into(),
         ]);
     }
 
@@ -619,11 +624,12 @@ impl Tutorial {
         /* The shader-table layout is as follows:
             Entry 0 - Ray-gen program
             Entry 1 - Miss program
-            Entry 2 - Hit program for triangle 0 and plane
-            Entry 3 - Hit program for triangle 1
-            Entry 4 - Hit program for triangle 2
+            Entry 2 - Hit program for triangle 0
+            Entry 3 - Hit program for the plane
+            Entry 4 - Hit program for triangle 1
+            Entry 5 - Hit program for triangle 2
             All entries in the shader-table must have the same size, so we will choose it base on the largest required entry.
-            The hit program requires the largest entry - sizeof(program identifier) + 8 bytes for a descriptor-table.
+            The triangle hit program requires the largest entry - sizeof(program identifier) + 8 bytes for a descriptor-table.
             The entry size must be aligned up to D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT
         */
 
@@ -632,7 +638,7 @@ impl Tutorial {
         self.shader_table_entry_size += 8; // The hit shader constant-buffer descriptor
 
         self.shader_table_entry_size = align_to(D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT, self.shader_table_entry_size);
-        let shader_table_size = self.shader_table_entry_size * 5;
+        let shader_table_size = self.shader_table_entry_size * 6;
 
         // For simplicity, we create the shader-table on the upload heap. You can also create it on the default heap
         let shader_table = self.create_buffer(shader_table_size as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &UPLOAD_HEAP_PROPS);
@@ -654,15 +660,27 @@ impl Tutorial {
         // Entry 1 - miss program
         memcpy(data.offset(self.shader_table_entry_size as _), rtso_prop.GetShaderIdentifier(W_MISS_SHADER), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
 
-        // Entry 2-4 - hit program. Program ID and one constant-buffer as root descriptor
-        for i in 0..3 {
-            let hit_entry = data.offset(self.shader_table_entry_size as isize * (2 + i)); // +2 skips the ray-gen and miss entries
-            memcpy(hit_entry, rtso_prop.GetShaderIdentifier(W_HIT_GROUP), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
-            let cb_desc = hit_entry.offset(D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _); // The location of the root-descriptor
-            assert!( cb_desc as usize % 8 == 0); // Root descriptor must be stored at an 8-byte aligned address
-            let cb_desc: *mut u64 = cb_desc as _;
-            *cb_desc = self.constant_buffers[i as usize].GetGPUVirtualAddress();
-        }
+        // Entry 2 - Triangle 0 hit program. ProgramID and constant-buffer data
+        let entry2 = data.offset(self.shader_table_entry_size as isize * 2);
+        memcpy(entry2, rtso_prop.GetShaderIdentifier(W_TRI_HIT_GROUP), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
+        let cb_desc = entry2.offset(D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _) as *mut u64;
+        *cb_desc = self.constant_buffers[0].GetGPUVirtualAddress();
+
+        // Entry 3 - Plane hit program. ProgramID only
+        let entry3 = data.offset(self.shader_table_entry_size as isize * 3);
+        memcpy(entry3, rtso_prop.GetShaderIdentifier(W_PLANE_HIT_GROUP), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
+
+        // Entry 4 - Triangle 1 hit. ProgramID and constant-buffer data
+        let entry4 = data.offset(self.shader_table_entry_size as isize * 4);
+        memcpy(entry4, rtso_prop.GetShaderIdentifier(W_TRI_HIT_GROUP), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
+        let cb_desc = entry4.offset(D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _) as *mut u64;
+        *cb_desc = self.constant_buffers[1].GetGPUVirtualAddress();
+
+        // Entry 5 - Triangle 2 hit. ProgramID and constant-buffer data
+        let entry5 = data.offset(self.shader_table_entry_size as isize * 5);
+        memcpy(entry5, rtso_prop.GetShaderIdentifier(W_TRI_HIT_GROUP), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
+        let cb_desc = entry5.offset(D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _) as *mut u64;
+        *cb_desc = self.constant_buffers[2].GetGPUVirtualAddress();
 
         // Unmap
         shader_table.Unmap(0, None);
@@ -672,12 +690,12 @@ impl Tutorial {
 
     }
     unsafe fn create_rt_pipeline_state(&mut self) {
-        // Need 12 subobjects:
+        // Need 13 subobjects:
         //  1 for the DXIL library
-        //  1 for hit-group
+        //  2 for the hit-groups (triangle hit group, plane hit-group)
         //  2 for RayGen root-signature (root-signature and the subobject association)
-        //  2 for hit-program root-signature (root-signature and the subobject association)
-        //  2 for miss-shader root-signature (signature and association)
+        //  2 for triangle hit-program root-signature (root-signature and the subobject association)
+        //  2 for plane hit-program and miss root-signature (root-signature and the subobject association)
         //  2 for shader config (shared between all programs. 1 for the config, 1 for association)
         //  1 for pipeline config
         //  1 for the global root signature
@@ -688,65 +706,71 @@ impl Tutorial {
         dxil_lib.create_dxil_library();
         subobjects.push(dxil_lib.state_subobject); // 0 Library
 
-        let mut hit_program = HitProgram::new(HIT_GROUP);
-        hit_program.init(PCWSTR::null(), W_CLOSEST_HIT_SHADER);
-        subobjects.push(hit_program.subobject); // 1 Library
+        // Create the triangle HitProgram
+        let mut tri_hit_program = HitProgram::new(TRI_HIT_GROUP);
+        tri_hit_program.init(PCWSTR::null(), W_TRIANGLE_CHS);
+        subobjects.push(tri_hit_program.subobject); // 1 Library
+
+        // Create the plane HitProgram
+        let mut plane_hit_program = HitProgram::new(PLANE_HIT_GROUP);
+        plane_hit_program.init(PCWSTR::null(), W_PLANE_CHS);
+        subobjects.push(plane_hit_program.subobject); // 2 Library
 
         // Create the ray-gen root-signature and association
         let mut ray_gen_root_signature_desc = RootSignatureDesc::new();
         ray_gen_root_signature_desc.ray_gen_root_signature_desc();
         let mut rgs_root_signature = RootSignature::new(&self.device, &ray_gen_root_signature_desc.desc);
         rgs_root_signature.init_local();
-        subobjects.push(rgs_root_signature.subobject); // 2 RayGen Root Sig
+        subobjects.push(rgs_root_signature.subobject); // 3 RayGen Root Sig
 
         let mut rgs_root_association = ExportAssociation::new();
         rgs_root_association.init(&[RAY_GEN_SHADER.into()], &subobjects[subobjects.len() - 1]);
-        subobjects.push(rgs_root_association.subobject); // 3 Associate Root Sig to RGS
+        subobjects.push(rgs_root_association.subobject); // 4 Associate Root Sig to RGS
 
-        // Create the hit root-signature and association
-        let mut hit_root_desc = RootSignatureDesc::new();
-        hit_root_desc.hit_root_desc();
-        let mut hit_root_signature = RootSignature::new(&self.device, &hit_root_desc.desc);
-        hit_root_signature.init_local();
-        subobjects.push(hit_root_signature.subobject); // 4 Hit Root Sig
+        // Create the tri hit root-signature and association
+        let mut tri_hit_root_desc = RootSignatureDesc::new();
+        tri_hit_root_desc.triangle_hit_root_desc();
+        let mut tri_hit_root_signature = RootSignature::new(&self.device, &tri_hit_root_desc.desc);
+        tri_hit_root_signature.init_local();
+        subobjects.push(tri_hit_root_signature.subobject); // 5 tri Hit Root Sig
 
         let mut hit_root_association = ExportAssociation::new();
-        hit_root_association.init(&[CLOSEST_HIT_SHADER.into()], &subobjects[subobjects.len() - 1]);
-        subobjects.push(hit_root_association.subobject); // 5 Associate Hit Root Sig to Hit Group
+        hit_root_association.init(&[TRIANGLE_CHS.into()], &subobjects[subobjects.len() - 1]);
+        subobjects.push(hit_root_association.subobject); // 6 Associate tri Hit Root Sig to Hit Group
 
-        // Create the miss root-signature and association
+        // Create the empty root-signature and associate it with the plane hit-group and miss-shader
         let empty_desc = D3D12_ROOT_SIGNATURE_DESC {
             Flags: D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE,
             ..Default::default()
         };
-        let mut miss_root_signature = RootSignature::new(&self.device, &empty_desc);
-        miss_root_signature.init_local();
-        subobjects.push(miss_root_signature.subobject); // 6 Miss Root Sig
+        let mut empty_root_signature = RootSignature::new(&self.device, &empty_desc);
+        empty_root_signature.init_local();
+        subobjects.push(empty_root_signature.subobject); // 7 Empty Root Sig for Plane Hit Group and Miss
 
-        let mut miss_root_association = ExportAssociation::new();
-        miss_root_association.init(&[MISS_SHADER.into()], &subobjects[subobjects.len() - 1]);
-        subobjects.push(miss_root_association.subobject); // 7 Associate Miss Root Sig to Miss Shader
+        let mut empty_root_association = ExportAssociation::new();
+        empty_root_association.init(&[PLANE_CHS.into(), MISS_SHADER.into()], &subobjects[subobjects.len() - 1]);
+        subobjects.push(empty_root_association.subobject); // 8 Associate empty root sig to Plane Hit Group and Miss shader
 
         // Bind the payload size to the programs
         let mut shader_config = ShaderConfig::new();
         shader_config.init((size_of::<f32>() * 2) as _, (size_of::<f32>() * 3) as _);
-        subobjects.push(shader_config.subobject); // 8 Shader Config
+        subobjects.push(shader_config.subobject); // 9 Shader Config
 
         let mut config_association = ExportAssociation::new();
-        config_association.init(&[MISS_SHADER.into(), CLOSEST_HIT_SHADER.into(), RAY_GEN_SHADER.into()], &subobjects[subobjects.len() - 1]);
-        subobjects.push(config_association.subobject); // 9 Associate Shader Config to Miss, CHS, RGS
+        config_association.init(&[MISS_SHADER.into(), TRIANGLE_CHS.into(), PLANE_CHS.into(), RAY_GEN_SHADER.into()], &subobjects[subobjects.len() - 1]);
+        subobjects.push(config_association.subobject); // 10 Associate Shader Config to Miss, CHS, RGS
 
         // Create the pipeline config
         let mut config = PipelineConfig::new();
         config.init(1);
-        subobjects.push(config.subobject);  // 10
+        subobjects.push(config.subobject);  // 11
 
         // Create the global root signature and store the empty signature
         let global_desc = D3D12_ROOT_SIGNATURE_DESC::default();
         let mut root = RootSignature::new(&self.device, &global_desc);
         root.init_global();
         self.empty_root_sig = Some(root.root_sig.clone());
-        subobjects.push(root.subobject); // 11
+        subobjects.push(root.subobject); // 12
 
         // Create the state
         let desc = D3D12_STATE_OBJECT_DESC {
@@ -919,7 +943,7 @@ impl Tutorial {
             memcpy((*instance_desc).Transform.as_mut_ptr(), m.as_ref(), size_of_val(&((*instance_desc).Transform)));
             (*instance_desc).AccelerationStructure = self.blas[blas_index].GetGPUVirtualAddress();
             (*instance_desc)._bitfield1 = 0xFF000000 | (i as u32);
-            (*instance_desc)._bitfield2 = i as u32;
+            (*instance_desc)._bitfield2 = if i == 0  { 0 } else { i + 1 } as u32;
         }
 
         // Unmap
@@ -1115,7 +1139,7 @@ impl Tutorial {
             },
             HitGroupTable: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
                 StartAddress: st_gpu_address + 2 * self.shader_table_entry_size as u64,
-                SizeInBytes: self.shader_table_entry_size as u64 * 3,
+                SizeInBytes: self.shader_table_entry_size as u64 * 4,
                 StrideInBytes: self.shader_table_entry_size as u64,
             },
             Width: self.swap_chain_size.x as _,
