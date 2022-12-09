@@ -263,9 +263,9 @@ struct Tutorial {
     fence: ID3D12Fence,
     fence_event: HANDLE,
     fence_value: u64,
-    vert_buf: Option<ID3D12Resource>,
+    vert_buf: Vec<ID3D12Resource>,
     tlas: Option<ID3D12Resource>,
-    blas: Option<ID3D12Resource>,
+    blas: Vec<ID3D12Resource>,
     tlas_size: u64,
     pipeline_state: Option<ID3D12StateObject>,
     empty_root_sig: Option<ID3D12RootSignature>,
@@ -780,6 +780,25 @@ impl Tutorial {
         self.device.CreateCommittedResource(heap_props, D3D12_HEAP_FLAG_NONE, &buf_desc, init_state, None, &mut buffer).unwrap();
         buffer.unwrap()
     }
+    unsafe fn create_plane_vert_buffer(&self) -> ID3D12Resource {
+        let vertices = [
+            vec3(-100.0, -1.0,  -2.0),
+            vec3( 100.0, -1.0,  100.0),
+            vec3(-100.0, -1.0,  100.0),
+
+            vec3(-100.0, -1.0,  -2.0),
+            vec3( 100.0, -1.0,  -2.0),
+            vec3( 100.0, -1.0,  100.0),
+        ];
+
+        // For simplicity, we create the vertex buffer on the upload heap, but that's not required
+        let vertex_buffer = self.create_buffer(size_of_val(&vertices) as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &UPLOAD_HEAP_PROPS);
+        let mut data = std::ptr::null_mut();
+        vertex_buffer.Map(0, None, Some(&mut data)).unwrap();
+        memcpy(data, vertices.as_ptr(), size_of_val(&vertices));
+        vertex_buffer.Unmap(0, None);
+        vertex_buffer
+    }
     unsafe fn create_triangle_vert_buffer(&self) -> ID3D12Resource {
         let vertices = [
             vec3(0.,       1., 0.),
@@ -801,31 +820,35 @@ impl Tutorial {
         vertex_buffer.Unmap(0, None);
         vertex_buffer
     }
-    unsafe fn create_blas(&self, vert_buf: &ID3D12Resource) -> BLASBuffers {
-        let geom_desc = D3D12_RAYTRACING_GEOMETRY_DESC {
-            Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
-            Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
-            Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
-                Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
-                    VertexFormat: DXGI_FORMAT_R32G32B32_FLOAT,
-                    VertexCount: 3,
-                    VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
-                        StartAddress: vert_buf.GetGPUVirtualAddress(),
-                        StrideInBytes: size_of::<Vec3>() as u64,
-                    },
-                    ..Default::default()
-                }
-            },
-        };
+
+    unsafe fn create_blas(&self, vert_buf: &[ID3D12Resource], vert_count: &[u32], geo_count: usize) -> BLASBuffers {
+        let mut geom_descs = Vec::new();
+        for i in 0..geo_count {
+            geom_descs.push(D3D12_RAYTRACING_GEOMETRY_DESC {
+                Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
+                Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+                Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
+                    Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
+                        VertexFormat: DXGI_FORMAT_R32G32B32_FLOAT,
+                        VertexCount: vert_count[i],
+                        VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
+                            StartAddress: vert_buf[i].GetGPUVirtualAddress(),
+                            StrideInBytes: size_of::<Vec3>() as u64,
+                        },
+                        ..Default::default()
+                    }
+                },
+            });
+        }
 
         // Get the size requirements for the scratch and AS buffers
         let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
             Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
             Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE,
-            NumDescs: 1,
+            NumDescs: geo_count as _,
             DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
             Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
-                pGeometryDescs: &geom_desc,
+                pGeometryDescs: geom_descs.as_ptr(),
             },
         };
         let mut info = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
@@ -858,7 +881,7 @@ impl Tutorial {
         self.cmd_list.ResourceBarrier(&[uav_barrier]);
         buffers
     }
-    unsafe fn create_tlas(&mut self, blas: ID3D12Resource) -> TLASBuffers {
+    unsafe fn create_tlas(&mut self) -> TLASBuffers {
         // First, get the size of the TLAS buffers and create them
         let mut inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
             Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
@@ -890,10 +913,11 @@ impl Tutorial {
             Mat4::from_translation(vec3(2.0, 0.0, 0.0)),
         ];
         for (i, m) in ms.iter().enumerate() {
+            let blas_index = if i == 0 { 0 } else { 1 };
             let instance_desc = instance_desc.offset(i as _);
             let m = m.transpose();
             memcpy((*instance_desc).Transform.as_mut_ptr(), m.as_ref(), size_of_val(&((*instance_desc).Transform)));
-            (*instance_desc).AccelerationStructure = blas.GetGPUVirtualAddress();
+            (*instance_desc).AccelerationStructure = self.blas[blas_index].GetGPUVirtualAddress();
             (*instance_desc)._bitfield1 = 0xFF000000 | (i as u32);
             (*instance_desc)._bitfield2 = i as u32;
         }
@@ -926,10 +950,20 @@ impl Tutorial {
         buffers
     }
     unsafe fn create_acceleration_structures(&mut self) {
-        let vert_buf = self.create_triangle_vert_buffer();
-        let bottom_level_buffer = self.create_blas(&vert_buf);
-        let top_level_buffer = self.create_tlas(bottom_level_buffer.result.clone());
-        self.vert_buf = Some(vert_buf);
+        self.vert_buf.push(self.create_triangle_vert_buffer());
+        self.vert_buf.push(self.create_plane_vert_buffer());
+        let vert_count = [3, 6];
+
+        let bottom_level_buffers = vec![
+            self.create_blas(&self.vert_buf, &vert_count, 2),
+            self.create_blas(&self.vert_buf, &vert_count, 1),
+        ];
+
+        for bottom_level_buffer in &bottom_level_buffers {
+            self.blas.push(bottom_level_buffer.result.clone())
+        }
+
+        let top_level_buffer = self.create_tlas();
 
         self.submit_cmd_list();
         self.fence.SetEventOnCompletion(self.fence_value, self.fence_event).unwrap();
@@ -937,7 +971,6 @@ impl Tutorial {
         //let buffer_index = swap_chain.GetCurrentBackBufferIndex();
         self.cmd_list.Reset(&self.frame_objects[0].cmd_allocator, None).unwrap();
 
-        self.blas = Some(bottom_level_buffer.result.clone());
         self.tlas = Some(top_level_buffer.result.clone());
     }
     unsafe fn submit_cmd_list(&mut self) {
@@ -990,9 +1023,9 @@ impl Tutorial {
             fence,
             fence_event,
             fence_value: 0,
-            vert_buf: None,
+            vert_buf: Vec::new(),
             tlas: None,
-            blas: None,
+            blas: Vec::new(),
             tlas_size: 0,
             pipeline_state: None,
             empty_root_sig: None,
