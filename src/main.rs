@@ -274,7 +274,7 @@ struct Tutorial {
     fence_event: HANDLE,
     fence_value: u64,
     vert_buf: Vec<ID3D12Resource>,
-    tlas: Option<ID3D12Resource>,
+    tlas: Option<TLASBuffers>,
     blas: Vec<ID3D12Resource>,
     tlas_size: u64,
     pipeline_state: Option<ID3D12StateObject>,
@@ -284,6 +284,7 @@ struct Tutorial {
     output_resource: Option<ID3D12Resource>,
     srv_uav_heap: Option<ID3D12DescriptorHeap>,
     constant_buffers: Vec<ID3D12Resource>,
+    rotation: f32,
 }
 
 struct HeapData {
@@ -964,11 +965,11 @@ impl Tutorial {
         self.cmd_list.ResourceBarrier(&[uav_barrier]);
         buffers
     }
-    unsafe fn create_tlas(&mut self) -> TLASBuffers {
+    unsafe fn build_tlas(&mut self, update: bool) {
         // First, get the size of the TLAS buffers and create them
         let mut inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
             Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
-            Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE,
+            Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE,
             NumDescs: 3,
             DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
             ..Default::default()
@@ -976,13 +977,28 @@ impl Tutorial {
         let mut info = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
         self.device.GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &mut info);
 
-        // Create the buffers
-        let buffers = TLASBuffers {
-            scratch: self.create_buffer(info.ScratchDataSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &DEFAULT_HEAP_PROPS),
-            result: self.create_buffer(info.ResultDataMaxSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, &DEFAULT_HEAP_PROPS),
-            instance_desc: self.create_buffer(3 * size_of::<D3D12_RAYTRACING_INSTANCE_DESC>() as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &UPLOAD_HEAP_PROPS),
-        };
-        self.tlas_size = info.ResultDataMaxSizeInBytes;
+        if update {
+            let tlas = self.tlas.as_ref().unwrap();
+            // If this a request for an update, then the TLAS was already used in a DispatchRay() call. We need a UAV barrier to make sure the read operation ends before updating the buffer
+            let uav_barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER{ pResource: Some(tlas.result.clone()) }),
+                },
+                ..Default::default()
+            };
+            self.cmd_list.ResourceBarrier(&[uav_barrier]);
+        } else {
+            // If this is not an update operation then we need to create the buffers, otherwise we will refit in-place
+            let buffers = TLASBuffers {
+                scratch: self.create_buffer(info.ScratchDataSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &DEFAULT_HEAP_PROPS),
+                result: self.create_buffer(info.ResultDataMaxSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, &DEFAULT_HEAP_PROPS),
+                instance_desc: self.create_buffer(3 * size_of::<D3D12_RAYTRACING_INSTANCE_DESC>() as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &UPLOAD_HEAP_PROPS),
+            };
+            self.tlas_size = info.ResultDataMaxSizeInBytes;
+            self.tlas = Some(buffers);
+        }
+        let buffers = self.tlas.as_ref().unwrap();
 
         // The instance desc should be inside a buffer, create and map the buffer
         let mut instance_desc = std::ptr::null_mut();
@@ -992,8 +1008,13 @@ impl Tutorial {
         // Initialize the instance desc. We only have a single instance
         let ms = [
             Mat4::IDENTITY,
-            Mat4::from_translation(vec3(-2.0, 0.0, 0.0)),
-            Mat4::from_translation(vec3(2.0, 0.0, 0.0)),
+            Mat4::from_translation(vec3(-2.0, 0.0, 0.0)) * Mat4::from_rotation_y(self.rotation),
+            Mat4::from_translation(vec3(2.0, 0.0, 0.0)) * Mat4::from_rotation_y(self.rotation),
+        ];
+        let ms = [
+            Mat4::IDENTITY,
+            Mat4::from_translation(vec3(-2.0, 0.0, 0.0)) * Mat4::from_rotation_y(self.rotation),
+            Mat4::from_translation(vec3(2.0, 0.0, 0.0)) * Mat4::from_rotation_y(self.rotation),
         ];
         for (i, m) in ms.iter().enumerate() {
             let blas_index = if i == 0 { 0 } else { 1 };
@@ -1012,12 +1033,17 @@ impl Tutorial {
         inputs.Anonymous = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
              InstanceDescs: buffers.instance_desc.GetGPUVirtualAddress(),
         };
-        let as_desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+        let mut as_desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
             DestAccelerationStructureData: buffers.result.GetGPUVirtualAddress(),
             Inputs: inputs,
             ScratchAccelerationStructureData: buffers.scratch.GetGPUVirtualAddress(),
             ..Default::default()
         };
+        // If this is an update operation, set the source buffer and the perform_update flag
+        if update {
+            as_desc.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+            as_desc.SourceAccelerationStructureData = buffers.result.GetGPUVirtualAddress();
+        }
 
         self.cmd_list.BuildRaytracingAccelerationStructure(&as_desc, None);
 
@@ -1030,7 +1056,6 @@ impl Tutorial {
             ..Default::default()
         };
         self.cmd_list.ResourceBarrier(&[uav_barrier]);
-        buffers
     }
     unsafe fn create_acceleration_structures(&mut self) {
         self.vert_buf.push(self.create_triangle_vert_buffer());
@@ -1046,15 +1071,13 @@ impl Tutorial {
             self.blas.push(bottom_level_buffer.result.clone())
         }
 
-        let top_level_buffer = self.create_tlas();
+        self.build_tlas(false);
 
         self.submit_cmd_list();
         self.fence.SetEventOnCompletion(self.fence_value, self.fence_event).unwrap();
         WaitForSingleObject(self.fence_event, INFINITE);
         //let buffer_index = swap_chain.GetCurrentBackBufferIndex();
         self.cmd_list.Reset(&self.frame_objects[0].cmd_allocator, None).unwrap();
-
-        self.tlas = Some(top_level_buffer.result.clone());
     }
     unsafe fn submit_cmd_list(&mut self) {
         self.cmd_list.Close().unwrap();
@@ -1117,6 +1140,7 @@ impl Tutorial {
             output_resource: None,
             srv_uav_heap: None,
             constant_buffers: Vec::new(),
+            rotation: 0.0,
         }
     }
     unsafe fn on_load(hwnd: HWND, width: i32, height: i32) -> Self {
@@ -1170,17 +1194,19 @@ impl Tutorial {
         // Prepare the command list for the next frame
         let buffer_index = self.swap_chain.GetCurrentBackBufferIndex() as usize;
 
-        // Make sure we have the new back-buffer is ready
-        if self.fence_value > DEFAULT_SWAP_CHAIN_BUFFERS as u64 {
-            self.fence.SetEventOnCompletion(self.fence_value - DEFAULT_SWAP_CHAIN_BUFFERS as u64 + 1, self.fence_event).unwrap();
-            WaitForSingleObject(self.fence_event, INFINITE);
-        }
+        // Sync. We need to do this because the TLAS resources are not double-buffered and we are going to update them
+        self.fence.SetEventOnCompletion(self.fence_value, self.fence_event).unwrap();
+        WaitForSingleObject(self.fence_event, INFINITE);
 
         self.frame_objects[buffer_index].cmd_allocator.Reset().unwrap();
         self.cmd_list.Reset(&self.frame_objects[buffer_index].cmd_allocator, None).unwrap();
     }
     unsafe fn on_frame_render(&mut self) {
         let rtv_index: usize = self.begin_frame();
+
+        // Refit the top-level acceleration structure
+        self.build_tlas(true);
+        self.rotation += 0.005;
 
         // Let's raytrace
         self.resource_barrier(self.output_resource.clone().unwrap(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1273,7 +1299,7 @@ impl Tutorial {
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 RaytracingAccelerationStructure: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_SRV {
-                    Location: self.tlas.as_ref().unwrap().GetGPUVirtualAddress(),
+                    Location: self.tlas.as_ref().unwrap().result.GetGPUVirtualAddress(),
                 },
             },
         };
