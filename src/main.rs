@@ -620,6 +620,11 @@ impl Tutorial {
         };
         self.cmd_list.ResourceBarrier(&[barrier]);
     }
+    unsafe fn write_addr_on_stb(&mut self, data: *mut u8, index: u32, id: PCWSTR, gpu_addr: u64) {
+        let rtso_prop: ID3D12StateObjectProperties = self.pipeline_state.as_ref().unwrap().cast().unwrap();
+        memcpy(data.offset((index * self.shader_table_entry_size) as isize), rtso_prop.GetShaderIdentifier(id), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
+        *(data.offset((index * self.shader_table_entry_size + D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES) as isize) as *mut u64) = gpu_addr;
+    }
     unsafe fn create_shader_table(&mut self) {
         /* The shader-table layout is as follows:
             Entry 0 - Ray-gen program
@@ -649,38 +654,27 @@ impl Tutorial {
 
         let rtso_prop: ID3D12StateObjectProperties = self.pipeline_state.as_ref().unwrap().cast().unwrap();
 
-        // Entry 0 - ray-gen program ID and descriptor data
-        memcpy(data, rtso_prop.GetShaderIdentifier(W_RAY_GEN_SHADER), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
-
         // This is where we need to set the descriptor data for the ray-gen shader.
         let heap_start = self.srv_uav_heap.as_ref().unwrap().GetGPUDescriptorHandleForHeapStart().ptr;
-        let ptr = data.offset(D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _) as *mut u64;
-        *ptr = heap_start;
+
+        // Entry 0 - ray-gen program ID and descriptor data
+        self.write_addr_on_stb(data, 0, W_RAY_GEN_SHADER, heap_start);
+
 
         // Entry 1 - miss program
-        memcpy(data.offset(self.shader_table_entry_size as _), rtso_prop.GetShaderIdentifier(W_MISS_SHADER), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
+        self.write_addr_on_stb(data, 1, W_MISS_SHADER, 0);
 
         // Entry 2 - Triangle 0 hit program. ProgramID and constant-buffer data
-        let entry2 = data.offset(self.shader_table_entry_size as isize * 2);
-        memcpy(entry2, rtso_prop.GetShaderIdentifier(W_TRI_HIT_GROUP), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
-        let cb_desc = entry2.offset(D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _) as *mut u64;
-        *cb_desc = self.constant_buffers[0].GetGPUVirtualAddress();
+        self.write_addr_on_stb(data, 2, W_TRI_HIT_GROUP, self.constant_buffers[0].GetGPUVirtualAddress());
 
         // Entry 3 - Plane hit program. ProgramID only
-        let entry3 = data.offset(self.shader_table_entry_size as isize * 3);
-        memcpy(entry3, rtso_prop.GetShaderIdentifier(W_PLANE_HIT_GROUP), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
+        self.write_addr_on_stb(data, 3, W_PLANE_HIT_GROUP, 0);
 
         // Entry 4 - Triangle 1 hit. ProgramID and constant-buffer data
-        let entry4 = data.offset(self.shader_table_entry_size as isize * 4);
-        memcpy(entry4, rtso_prop.GetShaderIdentifier(W_TRI_HIT_GROUP), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
-        let cb_desc = entry4.offset(D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _) as *mut u64;
-        *cb_desc = self.constant_buffers[1].GetGPUVirtualAddress();
+        self.write_addr_on_stb(data, 4, W_TRI_HIT_GROUP, self.constant_buffers[1].GetGPUVirtualAddress());
 
         // Entry 5 - Triangle 2 hit. ProgramID and constant-buffer data
-        let entry5 = data.offset(self.shader_table_entry_size as isize * 5);
-        memcpy(entry5, rtso_prop.GetShaderIdentifier(W_TRI_HIT_GROUP), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
-        let cb_desc = entry5.offset(D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _) as *mut u64;
-        *cb_desc = self.constant_buffers[2].GetGPUVirtualAddress();
+        self.write_addr_on_stb(data, 5, W_TRI_HIT_GROUP, self.constant_buffers[2].GetGPUVirtualAddress());
 
         // Unmap
         shader_table.Unmap(0, None);
