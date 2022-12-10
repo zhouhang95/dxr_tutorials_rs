@@ -276,7 +276,6 @@ struct Tutorial {
     vert_buf: Vec<ID3D12Resource>,
     tlas: Option<TLASBuffers>,
     blas: Vec<ID3D12Resource>,
-    tlas_size: u64,
     pipeline_state: Option<ID3D12StateObject>,
     empty_root_sig: Option<ID3D12RootSignature>,
     shader_table: Option<ID3D12Resource>,
@@ -656,6 +655,16 @@ impl Tutorial {
         };
         self.cmd_list.ResourceBarrier(&[barrier]);
     }
+    unsafe fn resource_barrier_uav(&self, resource: ID3D12Resource) {
+        let barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER{ pResource: Some(resource) }),
+            },
+            ..Default::default()
+        };
+        self.cmd_list.ResourceBarrier(&[barrier]);
+    }
     unsafe fn write_addr_on_stb(&mut self, data: *mut u8, index: u32, id: PCWSTR, gpu_addr: u64) {
         let rtso_prop: ID3D12StateObjectProperties = self.pipeline_state.as_ref().unwrap().cast().unwrap();
         memcpy(data.offset((index * self.shader_table_entry_size) as isize), rtso_prop.GetShaderIdentifier(id), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as _);
@@ -955,14 +964,7 @@ impl Tutorial {
         self.cmd_list.BuildRaytracingAccelerationStructure(&as_desc, None);
 
         // We need to insert a UAV barrier before using the acceleration structures in a raytracing operation
-        let uav_barrier = D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER{ pResource: Some(buffers.result.clone()) }),
-            },
-            ..Default::default()
-        };
-        self.cmd_list.ResourceBarrier(&[uav_barrier]);
+        self.resource_barrier_uav(buffers.result.clone());
         buffers
     }
     unsafe fn build_tlas(&mut self, update: bool) {
@@ -980,14 +982,7 @@ impl Tutorial {
         if update {
             let tlas = self.tlas.as_ref().unwrap();
             // If this a request for an update, then the TLAS was already used in a DispatchRay() call. We need a UAV barrier to make sure the read operation ends before updating the buffer
-            let uav_barrier = D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER{ pResource: Some(tlas.result.clone()) }),
-                },
-                ..Default::default()
-            };
-            self.cmd_list.ResourceBarrier(&[uav_barrier]);
+            self.resource_barrier_uav(tlas.result.clone());
         } else {
             // If this is not an update operation then we need to create the buffers, otherwise we will refit in-place
             let buffers = TLASBuffers {
@@ -995,7 +990,6 @@ impl Tutorial {
                 result: self.create_buffer(info.ResultDataMaxSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, &DEFAULT_HEAP_PROPS),
                 instance_desc: self.create_buffer(3 * size_of::<D3D12_RAYTRACING_INSTANCE_DESC>() as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &UPLOAD_HEAP_PROPS),
             };
-            self.tlas_size = info.ResultDataMaxSizeInBytes;
             self.tlas = Some(buffers);
         }
         let buffers = self.tlas.as_ref().unwrap();
@@ -1006,11 +1000,6 @@ impl Tutorial {
         let instance_desc: *mut D3D12_RAYTRACING_INSTANCE_DESC = instance_desc as _;
 
         // Initialize the instance desc. We only have a single instance
-        let ms = [
-            Mat4::IDENTITY,
-            Mat4::from_translation(vec3(-2.0, 0.0, 0.0)) * Mat4::from_rotation_y(self.rotation),
-            Mat4::from_translation(vec3(2.0, 0.0, 0.0)) * Mat4::from_rotation_y(self.rotation),
-        ];
         let ms = [
             Mat4::IDENTITY,
             Mat4::from_translation(vec3(-2.0, 0.0, 0.0)) * Mat4::from_rotation_y(self.rotation),
@@ -1132,7 +1121,6 @@ impl Tutorial {
             vert_buf: Vec::new(),
             tlas: None,
             blas: Vec::new(),
-            tlas_size: 0,
             pipeline_state: None,
             empty_root_sig: None,
             shader_table: None,
