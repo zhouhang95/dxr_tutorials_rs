@@ -25,6 +25,9 @@ const TRIANGLE_CHS: &str = "triangleChs";
 const PLANE_CHS: &str = "planeChs";
 const TRI_HIT_GROUP: &str = "TriHitGroup";
 const PLANE_HIT_GROUP: &str = "PlaneHitGroup";
+const SHADOW_CHS: &str = "shadowChs";
+const SHADOW_MISS: &str = "shadowMiss";
+const SHADOW_HIT_GROUP: &str = "ShadowHitGroup";
 
 const W_RAY_GEN_SHADER: PCWSTR = w!("rayGen");
 const W_MISS_SHADER: PCWSTR = w!("miss");
@@ -32,6 +35,9 @@ const W_TRIANGLE_CHS: PCWSTR = w!("triangleChs");
 const W_PLANE_CHS: PCWSTR = w!("planeChs");
 const W_TRI_HIT_GROUP: PCWSTR = w!("TriHitGroup");
 const W_PLANE_HIT_GROUP: PCWSTR = w!("PlaneHitGroup");
+const W_SHADOW_CHS: PCWSTR = w!("shadowChs");
+const W_SHADOW_MISS: PCWSTR = w!("shadowMiss");
+const W_SHADOW_HIT_GROUP: PCWSTR = w!("ShadowHitGroup");
 
 const DXC: Lazy<D3D12ShaderCompilerInfo> = Lazy::new(|| {
     D3D12ShaderCompilerInfo::new()
@@ -419,6 +425,33 @@ impl RootSignatureDesc {
             ..Default::default()
         };
     }
+    fn plane_hit_root_desc(&mut self) {
+        self.range.push(D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        });
+
+        self.root_params.push(D3D12_ROOT_PARAMETER{
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: self.range.as_ptr(),
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        });
+
+        self.desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: 1,
+            pParameters: self.root_params.as_ptr(),
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE,
+            ..Default::default()
+        };
+    }
     fn triangle_hit_root_desc(&mut self) {
         self.root_params.push(D3D12_ROOT_PARAMETER{
             ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
@@ -601,6 +634,8 @@ impl DxilLibrary {
             MISS_SHADER.into(),
             PLANE_CHS.into(),
             TRIANGLE_CHS.into(),
+            SHADOW_CHS.into(),
+            SHADOW_MISS.into(),
         ]);
     }
 
@@ -628,13 +663,14 @@ impl Tutorial {
     unsafe fn create_shader_table(&mut self) {
         /* The shader-table layout is as follows:
             Entry 0 - Ray-gen program
-            Entry 1 - Miss program
-            Entry 2 - Hit program for triangle 0
-            Entry 3 - Hit program for the plane
-            Entry 4 - Hit program for triangle 1
-            Entry 5 - Hit program for triangle 2
+            Entry 1 - Miss program for the primary ray
+            Entry 2 - Miss program for the shadow ray
+            Entries 3,4 - Hit programs for triangle 0 (primary followed by shadow)
+            Entries 5,6 - Hit programs for the plane (primary followed by shadow)
+            Entries 7,8 - Hit programs for triangle 1 (primary followed by shadow)
+            Entries 9,10 - Hit programs for triangle 2 (primary followed by shadow)
             All entries in the shader-table must have the same size, so we will choose it base on the largest required entry.
-            The triangle hit program requires the largest entry - sizeof(program identifier) + 8 bytes for a descriptor-table.
+            The triangle primary-ray hit program requires the largest entry - sizeof(program identifier) + 8 bytes for a descriptor-table.
             The entry size must be aligned up to D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT
         */
 
@@ -643,7 +679,7 @@ impl Tutorial {
         self.shader_table_entry_size += 8; // The hit shader constant-buffer descriptor
 
         self.shader_table_entry_size = align_to(D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT, self.shader_table_entry_size);
-        let shader_table_size = self.shader_table_entry_size * 6;
+        let shader_table_size = self.shader_table_entry_size * 11;
 
         // For simplicity, we create the shader-table on the upload heap. You can also create it on the default heap
         let shader_table = self.create_buffer(shader_table_size as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &UPLOAD_HEAP_PROPS);
@@ -652,29 +688,41 @@ impl Tutorial {
         let mut data: *mut u8 = std::ptr::null_mut();
         shader_table.Map(0, None, Some(&mut data as *mut *mut u8 as _)).unwrap();
 
-        let rtso_prop: ID3D12StateObjectProperties = self.pipeline_state.as_ref().unwrap().cast().unwrap();
-
         // This is where we need to set the descriptor data for the ray-gen shader.
         let heap_start = self.srv_uav_heap.as_ref().unwrap().GetGPUDescriptorHandleForHeapStart().ptr;
 
         // Entry 0 - ray-gen program ID and descriptor data
         self.write_addr_on_stb(data, 0, W_RAY_GEN_SHADER, heap_start);
 
-
-        // Entry 1 - miss program
+        // Entry 1 - primary ray miss
         self.write_addr_on_stb(data, 1, W_MISS_SHADER, 0);
+ 
+        // Entry 2 - shadow ray miss
+        self.write_addr_on_stb(data, 2, W_SHADOW_MISS, 0);
 
-        // Entry 2 - Triangle 0 hit program. ProgramID and constant-buffer data
-        self.write_addr_on_stb(data, 2, W_TRI_HIT_GROUP, self.constant_buffers[0].GetGPUVirtualAddress());
+        // Entry 3 - Triangle 0, primary ray. ProgramID and constant-buffer data
+        self.write_addr_on_stb(data, 3, W_TRI_HIT_GROUP, self.constant_buffers[0].GetGPUVirtualAddress());
+        
+        // Entry 4 - Triangle 0, shadow ray. ProgramID only
+        self.write_addr_on_stb(data, 4, W_SHADOW_HIT_GROUP, 0);
+        
+        // Entry 5 - Plane, primary ray. ProgramID only and the TLAS SRV
+        self.write_addr_on_stb(data, 5, W_PLANE_HIT_GROUP, heap_start + self.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as u64);
+        
+        // Entry 6 - Plane, shadow ray
+        self.write_addr_on_stb(data, 6, W_SHADOW_HIT_GROUP, 0);
 
-        // Entry 3 - Plane hit program. ProgramID only
-        self.write_addr_on_stb(data, 3, W_PLANE_HIT_GROUP, 0);
+        // Entry 7 - Triangle 1, primary ray. ProgramID and constant-buffer data
+        self.write_addr_on_stb(data, 7, W_TRI_HIT_GROUP, self.constant_buffers[1].GetGPUVirtualAddress());
 
-        // Entry 4 - Triangle 1 hit. ProgramID and constant-buffer data
-        self.write_addr_on_stb(data, 4, W_TRI_HIT_GROUP, self.constant_buffers[1].GetGPUVirtualAddress());
+        // Entry 8 - Triangle 1, shadow ray. ProgramID only
+        self.write_addr_on_stb(data, 8, W_SHADOW_HIT_GROUP, 0);
 
-        // Entry 5 - Triangle 2 hit. ProgramID and constant-buffer data
-        self.write_addr_on_stb(data, 5, W_TRI_HIT_GROUP, self.constant_buffers[2].GetGPUVirtualAddress());
+        // Entry 9 - Triangle 2, primary ray. ProgramID and constant-buffer data
+        self.write_addr_on_stb(data, 9, W_TRI_HIT_GROUP, self.constant_buffers[2].GetGPUVirtualAddress());
+
+        // Entry 10 - Triangle 2, shadow ray. ProgramID only
+        self.write_addr_on_stb(data, 10, W_SHADOW_HIT_GROUP, 0);
 
         // Unmap
         shader_table.Unmap(0, None);
@@ -684,12 +732,13 @@ impl Tutorial {
 
     }
     unsafe fn create_rt_pipeline_state(&mut self) {
-        // Need 13 subobjects:
+        // Need 16 subobjects:
         //  1 for the DXIL library
-        //  2 for the hit-groups (triangle hit group, plane hit-group)
+        //  3 for the hit-groups (triangle hit group, plane hit-group, shadow-hit group)
         //  2 for RayGen root-signature (root-signature and the subobject association)
         //  2 for triangle hit-program root-signature (root-signature and the subobject association)
-        //  2 for plane hit-program and miss root-signature (root-signature and the subobject association)
+        //  2 for the plane-hit root-signature (root-signature and the subobject association)
+        //  2 for shadow-program and miss root-signature (root-signature and the subobject association)
         //  2 for shader config (shared between all programs. 1 for the config, 1 for association)
         //  1 for pipeline config
         //  1 for the global root signature
@@ -710,61 +759,77 @@ impl Tutorial {
         plane_hit_program.init(PCWSTR::null(), W_PLANE_CHS);
         subobjects.push(plane_hit_program.subobject); // 2 Library
 
+        // Create the shadow-ray hit group
+        let mut shadow_hit_program = HitProgram::new(SHADOW_HIT_GROUP);
+        shadow_hit_program.init(PCWSTR::null(), W_SHADOW_CHS);
+        subobjects.push(shadow_hit_program.subobject); // 3 Shadow Hit Group
+
         // Create the ray-gen root-signature and association
         let mut ray_gen_root_signature_desc = RootSignatureDesc::new();
         ray_gen_root_signature_desc.ray_gen_root_signature_desc();
         let mut rgs_root_signature = RootSignature::new(&self.device, &ray_gen_root_signature_desc.desc);
         rgs_root_signature.init_local();
-        subobjects.push(rgs_root_signature.subobject); // 3 RayGen Root Sig
+        subobjects.push(rgs_root_signature.subobject); // 4 RayGen Root Sig
 
         let mut rgs_root_association = ExportAssociation::new();
         rgs_root_association.init(&[RAY_GEN_SHADER.into()], &subobjects[subobjects.len() - 1]);
-        subobjects.push(rgs_root_association.subobject); // 4 Associate Root Sig to RGS
+        subobjects.push(rgs_root_association.subobject); // 5 Associate Root Sig to RGS
 
         // Create the tri hit root-signature and association
         let mut tri_hit_root_desc = RootSignatureDesc::new();
         tri_hit_root_desc.triangle_hit_root_desc();
         let mut tri_hit_root_signature = RootSignature::new(&self.device, &tri_hit_root_desc.desc);
         tri_hit_root_signature.init_local();
-        subobjects.push(tri_hit_root_signature.subobject); // 5 tri Hit Root Sig
+        subobjects.push(tri_hit_root_signature.subobject); // 6 tri Hit Root Sig
 
         let mut hit_root_association = ExportAssociation::new();
         hit_root_association.init(&[TRIANGLE_CHS.into()], &subobjects[subobjects.len() - 1]);
-        subobjects.push(hit_root_association.subobject); // 6 Associate tri Hit Root Sig to Hit Group
+        subobjects.push(hit_root_association.subobject); // 7 Associate tri Hit Root Sig to Hit Group
 
-        // Create the empty root-signature and associate it with the plane hit-group and miss-shader
+        // Create the plane hit root-signature and association
+        let mut plane_hit_root_desc = RootSignatureDesc::new();
+        plane_hit_root_desc.plane_hit_root_desc();
+        let mut plane_hit_root_signature = RootSignature::new(&self.device, &plane_hit_root_desc.desc);
+        plane_hit_root_signature.init_local();
+        subobjects.push(plane_hit_root_signature.subobject); // 8 Plane Hit Root Sig
+
+        let mut plane_hit_root_association = ExportAssociation::new();
+        plane_hit_root_association.init(&[PLANE_CHS.into()], &subobjects[subobjects.len() - 1]);
+        subobjects.push(plane_hit_root_association.subobject); // 9 Associate Plane Hit Root Sig to Plane Hit Group
+
+        // Create the empty root-signature and associate it with the primary miss-shader and the shadow programs
         let empty_desc = D3D12_ROOT_SIGNATURE_DESC {
             Flags: D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE,
             ..Default::default()
         };
         let mut empty_root_signature = RootSignature::new(&self.device, &empty_desc);
         empty_root_signature.init_local();
-        subobjects.push(empty_root_signature.subobject); // 7 Empty Root Sig for Plane Hit Group and Miss
+        subobjects.push(empty_root_signature.subobject); // 10 Empty Root Sig for Plane Hit Group and Miss
 
         let mut empty_root_association = ExportAssociation::new();
-        empty_root_association.init(&[PLANE_CHS.into(), MISS_SHADER.into()], &subobjects[subobjects.len() - 1]);
-        subobjects.push(empty_root_association.subobject); // 8 Associate empty root sig to Plane Hit Group and Miss shader
+        empty_root_association.init(&[SHADOW_CHS.into(), SHADOW_MISS.into(), MISS_SHADER.into()], &subobjects[subobjects.len() - 1]);
+        subobjects.push(empty_root_association.subobject); // 11 Associate empty root sig to Plane Hit Group and Miss shader
 
         // Bind the payload size to the programs
         let mut shader_config = ShaderConfig::new();
         shader_config.init((size_of::<f32>() * 2) as _, (size_of::<f32>() * 3) as _);
-        subobjects.push(shader_config.subobject); // 9 Shader Config
+        subobjects.push(shader_config.subobject); // 12 Shader Config
 
         let mut config_association = ExportAssociation::new();
-        config_association.init(&[MISS_SHADER.into(), TRIANGLE_CHS.into(), PLANE_CHS.into(), RAY_GEN_SHADER.into()], &subobjects[subobjects.len() - 1]);
-        subobjects.push(config_association.subobject); // 10 Associate Shader Config to Miss, CHS, RGS
+        config_association.init(&[SHADOW_CHS.into(), SHADOW_MISS.into(), MISS_SHADER.into(), TRIANGLE_CHS.into(), PLANE_CHS.into(), RAY_GEN_SHADER.into()], &subobjects[subobjects.len() - 1]);
+        subobjects.push(config_association.subobject); // 13 Associate Shader Config to Miss, CHS, RGS
 
         // Create the pipeline config
         let mut config = PipelineConfig::new();
-        config.init(1);
-        subobjects.push(config.subobject);  // 11
+        config.init(2);
+        subobjects.push(config.subobject);  // 14
 
         // Create the global root signature and store the empty signature
         let global_desc = D3D12_ROOT_SIGNATURE_DESC::default();
         let mut root = RootSignature::new(&self.device, &global_desc);
         root.init_global();
         self.empty_root_sig = Some(root.root_sig.clone());
-        subobjects.push(root.subobject); // 12
+        subobjects.push(root.subobject); // 15
 
         // Create the state
         let desc = D3D12_STATE_OBJECT_DESC {
@@ -937,7 +1002,7 @@ impl Tutorial {
             memcpy((*instance_desc).Transform.as_mut_ptr(), m.as_ref(), size_of_val(&((*instance_desc).Transform)));
             (*instance_desc).AccelerationStructure = self.blas[blas_index].GetGPUVirtualAddress();
             (*instance_desc)._bitfield1 = 0xFF000000 | (i as u32);
-            (*instance_desc)._bitfield2 = if i == 0  { 0 } else { i + 1 } as u32;
+            (*instance_desc)._bitfield2 = if i == 0  { 0 } else { i * 2 + 2 } as u32;
         }
 
         // Unmap
@@ -1128,12 +1193,12 @@ impl Tutorial {
             },
             MissShaderTable: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
                 StartAddress: st_gpu_address + 1 * self.shader_table_entry_size as u64,
-                SizeInBytes: self.shader_table_entry_size as u64, // Only a s single miss-entry
+                SizeInBytes: 2 * self.shader_table_entry_size as u64, // 2 miss-entries
                 StrideInBytes: self.shader_table_entry_size as u64,
             },
             HitGroupTable: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
-                StartAddress: st_gpu_address + 2 * self.shader_table_entry_size as u64,
-                SizeInBytes: self.shader_table_entry_size as u64 * 4,
+                StartAddress: st_gpu_address + 3 * self.shader_table_entry_size as u64,
+                SizeInBytes: self.shader_table_entry_size as u64 * 8,
                 StrideInBytes: self.shader_table_entry_size as u64,
             },
             Width: self.swap_chain_size.x as _,
