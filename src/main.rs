@@ -160,7 +160,7 @@ unsafe fn msg_loop(tutorial: &mut Tutorial) {
             DispatchMessageW(&message);
         } else {
             tutorial.on_frame_render();
-
+            tutorial.frame_stats();
         }
     }
 }
@@ -273,6 +273,7 @@ struct Tutorial {
     fence: ID3D12Fence,
     fence_event: HANDLE,
     fence_value: u64,
+    frame_stats: FrameStats,
     vert_buf: Vec<ID3D12Resource>,
     tlas: Option<TLASBuffers>,
     blas: Vec<ID3D12Resource>,
@@ -641,7 +642,42 @@ impl DxilLibrary {
 
 }
 
+struct FrameStats {
+    start_time: std::time::Instant,
+    elapsed_time: f32,
+    frame_count: u32,
+}
+
+impl FrameStats {
+    fn new() -> Self {
+        Self {
+            start_time: std::time::Instant::now(),
+            elapsed_time: 0f32,
+            frame_count: 0,
+        }
+    }
+    fn frame_stats(&mut self) -> Option<f32> {
+        self.frame_count += 1;
+        let now = self.start_time.elapsed().as_secs_f32();
+        let diff = now - self.elapsed_time;
+        if diff > 1f32 {
+            let fps = self.frame_count as f32 / diff;
+            self.frame_count = 0;
+            self.elapsed_time = now;
+            Some(fps)
+        } else {
+            None
+        }
+    }
+}
+
 impl Tutorial {
+    unsafe fn frame_stats(&mut self) {
+        if let Some(fps) = self.frame_stats.frame_stats() {
+            let title: HSTRING = format!("fps: {}", fps).into();
+            SetWindowTextW(self.hwnd, &title);
+        }
+    }
     unsafe fn resource_barrier(&self, resource: ID3D12Resource, state_before: D3D12_RESOURCE_STATES, state_after: D3D12_RESOURCE_STATES) {
         let mut barrier = D3D12_RESOURCE_BARRIER::default();
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1118,6 +1154,7 @@ impl Tutorial {
             fence,
             fence_event,
             fence_value: 0,
+            frame_stats: FrameStats::new(),
             vert_buf: Vec::new(),
             tlas: None,
             blas: Vec::new(),
